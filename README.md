@@ -1,4 +1,4 @@
-# 🎵 AI UMG Content Tagging Platform
+# 🎵 Content Tagging Platform
 
 An AI-assisted Streamlit application for automating TikTok User Generated Content (UGC) analysis and tagging.
 
