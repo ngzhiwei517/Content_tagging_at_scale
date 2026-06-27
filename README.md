@@ -121,18 +121,6 @@ Merge into Original Report
 Export Final Dataset
 ---
 
-# Project Structure
-
-ugc-tagger/
-│
-├── app.py
-├── requirements.txt
-├── README.md
-├── .gitignore
-│
-└── assets/
----
-
 # Installation
 
 Clone the repository
