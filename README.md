@@ -1,4 +1,4 @@
-# 🎵 AI UGC Content Tagging Platform
+# 🎵 AI UMG Content Tagging Platform
 
 An AI-assisted Streamlit application for automating TikTok User Generated Content (UGC) analysis and tagging.
 
@@ -11,7 +11,7 @@ An AI-assisted Streamlit application for automating TikTok User Generated Conten
 
 ## 📌 Overview
 
-This project automates the manual workflow of tagging TikTok UGC posts for music marketing analysis.
+This project automates the manual workflow of tagging TikTok posts for music marketing analysis.
 
 Instead of manually reviewing every TikTok post, the application uses Google's Gemini AI to generate structured content tags while allowing analysts to review uncertain cases before exporting the final dataset.
 
