@@ -249,14 +249,9 @@ ALLOWED_CREATIVE_TYPES = [
 ALLOWED_SET = set(ALLOWED_CREATIVE_TYPES)
 
 NARRATIVE_OPTIONS = [
-    'NA', 'Relationship', 'Friendship', 'Family', 'Lifestyle',
-    'Dance', 'Simple Dance', 'Dance Tutorial', 'Lip Sync',
-    'Fashion', 'Beauty', 'Product Showcase', 'Tutorial',
-    'Travel', 'Beach Vacation', 'Food', 'Fitness', 'Comedy',
-    'Reflection', 'Healing', 'Quotes', 'Motivation',
-    'Celebrity Edit', 'Drama Edit', 'Gaming', 'Celebration',
-    'Study', 'Work', 'Pets', 'CNY', 'Ramadan',
-    'Custom', 'Other'
+    'CNY', 'Relationship', 'Friendship', 'Family', 'Fashion',
+    'Dance', 'Food', 'Travel', 'Fitness', 'Comedy',
+    'Reflection', 'Quotes', 'Lifestyle', 'Custom', 'Other'
 ]
 
 VAGUE_PATTERNS = [r'^[\W\s\d]+$', r'^.{0,15}$']
@@ -654,10 +649,8 @@ def build_prompt(row):
     saves      = row.get('collectCount', 0)
     is_slide   = row.get('isSlideshow', False)
     allowed_str = '\n'.join(f'  - {t}' for t in ALLOWED_CREATIVE_TYPES)
-    return f"""You are a senior TikTok UGC content analyst for Universal Music Group.
-Your task is to classify TikTok posts for music marketing analysis across Malaysia, Philippines, Singapore, Korea, Thailand, Vietnam and wider SEA markets.
-
-Return ONLY valid JSON. No markdown. No explanation outside JSON.
+    return f"""You are a TikTok content analyst for a music marketing project covering SEA and Korean markets.
+Analyse this TikTok post. Return ONLY valid JSON — no markdown, no explanation.
 
 === POST METADATA ===
 Caption: {caption}
@@ -667,230 +660,42 @@ Music: {music} by {music_auth}
 Duration: {duration}s | Market: {location} | Is Slideshow: {is_slide}
 Plays: {play:,} | Likes: {likes:,} | Shares: {shares:,} | Saves: {saves:,}
 
-=== ALLOWED CREATIVE TYPE LABELS ===
-Use exact spelling only:
+=== ALLOWED CREATIVE TYPE LABELS (exact spelling required) ===
 {allowed_str}
 
-=== VERY IMPORTANT CLASSIFICATION PRINCIPLE ===
-Do NOT simply describe the scene. Classify the PRIMARY CONTENT FORMAT.
-Ask: "What type of TikTok content is this?" rather than "What objects appear in the frame?"
+=== TAGGING RULES ===
+NARRATIVE (one word):
+- CNY: Chinese/Lunar New Year, qipao, ang pao, red packets, festive outfits, CNY family/friend scenes, zodiac/horoscope for new year
+- Relationship: couple content, love stories, boyfriend/girlfriend
+- Friendship: friend groups, bestie content, squad
+- Family: parent-child, siblings, home life
+- Fashion: OOTD, styling, lookbook, outfit showcase
+- Dance: dance challenge, choreography tutorial
+- Food: cooking, eating, restaurant
+- Travel: places, trips, tourism
+- Fitness: workout, gym, exercise
+- Comedy: funny, prank, skit
 
-Examples:
-- A person dancing in a mall is Dance, not Slice of Life.
-- A person mouthing lyrics in a bedroom is Lip Sync, not Slice of Life.
-- A drama/anime/movie scene edit is Movie/Tv/Drama Edits, not Slice of Life.
-- A K-pop idol photo/video montage is Celebrity Edits, not Slice of Life.
-- A makeup routine is Beauty, not Fashion, even if the outfit is nice.
+CREATIVE TYPE (1-2 labels, exact spelling):
+- Outfit showcase / OOTD / styling / lookbook → Fashion
+- Makeup tutorial / skincare / beauty transformation → Beauty
+- Dance challenge / choreography / dance tutorial → Dance
+- Photo slideshow / isSlideshow=true → Carousel
+- Couple trend / relationship POV → Relationship
+- Singing along to song → Lip Sync
+- Lyrics displayed on screen → Lyrics or Lyrics Translation
+- Everyday moments / personal storytelling → Slice of Life
+- Reaction / news / education / explainer → Media/Infotainment
+- Horoscope / forecast / zodiac → Media/Infotainment
+- Funny skit / prank / comedy → Comedy
+- Remix: ONLY if audio is clearly sped up/slowed down/mashup. NEVER for fashion rework or visual transitions.
 
-=== OUTPUT RULES ===
-- Creative Type: return 1 or 2 labels only.
-- If isSlideshow=true, ALWAYS include Carousel as one label.
-- If Carousel is included, use the second label for the actual content type when possible, e.g. ["Carousel", "Beauty"].
-- Do not use Slice of Life as a fallback when a more specific label applies.
-- If uncertain, choose the strongest visible signal and lower confidence.
-- Remix is audio-only. Never use Remix for visual transitions, outfit changes, or editing style.
+CONTENT DETAILS (one sentence): Describe what happens + visual aesthetic. Mention colours, transitions, setting, mood.
+CONFIDENCE (0.0-1.0): 0.9-1.0 clear signal, 0.7-0.8 some signal, <0.7 vague, 0.0 cannot determine.
+REASONING: one short sentence.
 
-=== NARRATIVE RULES ===
-Narrative is a short flexible theme phrase, NOT a fixed category.
-Write 1 to 5 words.
-Use NA only if no meaningful theme is visible.
-
-Good narrative examples:
-- Simple dance
-- Girl lip syncing
-- Dance tutorial
-- Idol edit
-- Drama edit
-- Beach vacation
-- Makeup routine
-- Product showcase
-- Rainy walk
-- Late night conversation
-- Missing someone
-- Campus life
-- Outfit showcase
-- Game edit
-- Healing
-- Relationship quote
-- Fitness flex
-- Cooking tutorial
-
-Do not force narrative into one label like Relationship or Lifestyle if a more specific short phrase fits.
-
-=== DECISION TREE — APPLY IN THIS ORDER ===
-1. Is this a slideshow/photo carousel? If yes, include Carousel.
-2. Is the main content from a movie, drama, TV show, anime, web series or fictional scene? Use Movie/Tv/Drama Edits.
-3. Is the main content a fan edit/montage of a real celebrity, idol, singer, actor, athlete, influencer or public figure? Use Celebrity Edits.
-4. Is visible choreography/dance performance the main focus? Use Dance.
-5. Is the creator mainly mouthing/singing lyrics or acting to audio with little/no choreography? Use Lip Sync.
-6. Is the creator performing a cover, singing/playing an instrument as their own performance? Use Cover.
-7. Is the main focus makeup, skincare, hair, nails or cosmetics? Use Beauty.
-8. Is the main focus clothing, outfit styling, OOTD, fit check or fashion haul? Use Fashion.
-9. Is the main message romantic love, longing, heartbreak, partner dynamics or affection for someone special? Use Relationship.
-10. Is it a first-person acted scenario or "POV" setup? Use POV, optionally with Comedy or Relationship.
-11. Is the main purpose humour, joke, meme, prank or comedic skit? Use Comedy.
-12. Are lyrics visibly displayed as the main content? Use Lyrics. If translated/bilingual lyrics are shown, use Lyrics Translation.
-13. Is the post educational/informative/tutorial/review/news/tips/DIY/product recommendation? Use Media/Infotainment.
-14. Is the main visual focus destination/scenery/vacation/travel vlog? Use Travel.
-15. Is the main focus gameplay/game UI/game characters/game edit? Use Gaming.
-16. Is the main focus workout, gym, sport training, physique, exercise or flexing? Use Fitness.
-17. Is it mainly a quote card/text quote? Use Quotes.
-18. Is it personal introspection, self-growth, emotional reflection or life lesson? Use Reflection.
-19. Is it ordinary daily life without a stronger specific label? Use Slice of Life.
-
-=== CREATIVE TYPE HANDBOOK ===
-
-1) Dance
-Definition: Dance performance or choreography is the dominant content format.
-Use for: dance challenge, choreography, hand gesture dance, group dance, idol dance challenge, dance tutorial, dance practice, dance trend.
-Do NOT confuse with:
-- Lip Sync: mouth movement/singing with no dominant choreography.
-- Slice of Life: everyday location does not matter if the main action is dancing.
-- Celebrity Edits: if the video is mainly an idol/celebrity montage, use Celebrity Edits; if it is a creator or group performing choreography, use Dance.
-Rule: If visible body movement/choreography is a major focus, classify as Dance even if captions are vague.
-Motion note: because only sampled frames may be available, if multiple frames show dance pose/choreography, choose Dance.
-
-2) Lip Sync
-Definition: Creator mouths lyrics/dialogue or sings along to the audio.
-Use for: singing along, mouthing lyrics, emotional lip-sync performance, acting to lyrics/dialogue, close-up singing to camera.
-Do NOT use when: full-body choreography is dominant -> Dance.
-Rule: If the main performance is face/mouth expression rather than choreography, choose Lip Sync.
-
-3) Cover
-Definition: Creator performs their own musical cover.
-Use for: singing cover, instrument cover, acoustic performance, piano/guitar/drum cover, vocal performance not just mouthing existing audio.
-Do NOT confuse with Lip Sync: Lip Sync = mouthing existing audio; Cover = creator performs the song.
-
-4) Movie/Tv/Drama Edits
-Definition: Edits or clips centered on fictional media.
-Use for: movie scenes, TV scenes, drama clips, K-drama edits, anime edits, fictional character edits, series montage, cinematic scene compilations.
-Do NOT confuse with:
-- Celebrity Edits: real celebrity/idol/public figure fan edit.
-- Slice of Life: fictional clips are never Slice of Life.
-Rule: If the content comes from a movie/show/drama/anime/fictional scene, choose Movie/Tv/Drama Edits.
-
-5) Celebrity Edits
-Definition: Fan edit or montage of a real public figure.
-Use for: K-pop idol edits, celebrity photos/videos, actor/artist/athlete montage, fancam edit, concert/performance edit, public figure compilation, F1 driver edit.
-Do NOT confuse with:
-- Movie/Tv/Drama Edits: fictional character/scene from drama/movie/anime.
-- Dance: if the main focus is a creator dancing, choose Dance; if it is a fan edit of an idol/celebrity, choose Celebrity Edits.
-Rule: If the subject is a real famous/public person and the format is edit/montage/fan content, choose Celebrity Edits.
-
-6) Beauty
-Definition: Makeup, skincare, hair, nails or cosmetics are the main focus.
-Use for: makeup routine, makeup tutorial, GRWM makeup, skincare products, skincare routine, eye makeup, lip makeup, hair tutorial, hairstyle transformation, nail art, beauty product carousel, cosmetic review.
-Do NOT use Beauty just because someone looks attractive.
-Do NOT confuse with Fashion: Fashion requires clothing/outfit to be the focus.
-Rule: If cosmetics/hair/skin/nails are the main action or product, choose Beauty.
-
-7) Fashion
-Definition: Clothing/outfit/styling is the main focus.
-Use for: OOTD, fit check, outfit showcase, outfit transition, clothing haul, lookbook, styling tips, accessories when styling is primary, mirror outfit check.
-Do NOT confuse with Beauty: makeup/skincare/hair/nails -> Beauty.
-Rule: If the video showcases what someone is wearing, choose Fashion.
-
-8) Relationship
-Definition: Romantic love, affection, longing, heartbreak, devotion or partner dynamics are central.
-Use for: couple content, boyfriend/girlfriend, husband/wife, missing someone, romantic quotes, affection for someone special, late-night conversation with someone special, relationship advice, emotional openness between partners, heartbreak.
-Do NOT use for ordinary daily memories unless romance is the main message.
-Rule: If the emotional meaning is about love/romance/partner, choose Relationship.
-
-9) Slice of Life
-Definition: Everyday real-life moments without a stronger specific format.
-Use for: daily routine, walking, studying, commuting, coffee, rain scenes, home life, casual memories, school/campus life, lifestyle montage, aesthetic ordinary life.
-Do NOT use as a default.
-Do NOT use when Dance, Lip Sync, Beauty, Fashion, Relationship, Travel, POV, Celebrity Edits or Movie/Tv/Drama Edits clearly apply.
-Rule: Slice of Life is only for ordinary life content with no more specific label.
-
-10) POV
-Definition: First-person scenario, roleplay, acted hypothetical, or explicit "POV:" framing.
-Use for: POV text, acted situation, scenario from viewer perspective, relationship POV, funny POV.
-Can combine with: Comedy, Relationship.
-Do NOT confuse with Slice of Life: if it is acted/framed as a scenario, choose POV.
-Rule: If the caption/on-screen text sets up a scenario such as "POV: ...", use POV.
-
-11) Comedy
-Definition: Main purpose is humour.
-Use for: joke, meme, prank, funny skit, humorous acting, exaggerated reaction, comedic situation.
-Can combine with: POV.
-Do NOT use if the content is only light-hearted but not primarily funny.
-
-12) Lyrics
-Definition: Original song lyrics are visibly displayed or are the central content.
-Use for: lyric video, lyric edit, karaoke-style text, emotional lyric text, post built around written lyrics.
-Do NOT use merely because the audio has lyrics.
-Rule: Lyrics must be visible or captionally central.
-
-13) Lyrics Translation
-Definition: Lyrics are translated into another language.
-Use for: bilingual lyrics, subtitle translation, translated lyric explanation.
-Rule: If both original lyrics and translated text are shown, choose Lyrics Translation.
-
-14) Quotes
-Definition: Standalone quote/saying is the main content.
-Use for: motivational quote, emotional quote, aesthetic quote card, relationship quote, short saying, text quote slideshow.
-Do NOT confuse with Reflection:
-- Quotes = presenting a quote/line.
-- Reflection = personal introspection or life lesson.
-
-15) Reflection
-Definition: Personal introspection, self-growth, emotional reflection or life lesson.
-Use for: self-acceptance, healing, mother's sacrifice, gratitude, sadness, personal realization, life lesson, emotional thoughts.
-Do NOT confuse with Quotes if the post only displays a quote without personal introspection.
-
-16) Media/Infotainment
-Definition: Informational, educational, explanatory, tutorial, review, news, DIY, tip-based or recommendation content.
-Use for: news article, facts, explainer, how-to, DIY, tutorial, recipe/cake idea, product recommendation, digicam review, horoscope/forecast, Valentine's bracelet idea.
-Do NOT confuse with Slice of Life: if it teaches/informs/recommends something, use Media/Infotainment.
-
-17) Travel
-Definition: Travel/destination/scenery is the main focus.
-Use for: beach, mountains, city view, vacation, tourism, trip vlog, landscape, destination montage, travel memory.
-Rule: If the visual focus is place/scenery/trip, choose Travel even if caption is emotional.
-
-18) Gaming
-Definition: Game-related content is central.
-Use for: gameplay, game screenshots, game UI, game character edit, game fan video, Minecraft, Genshin, Racing Master, Omori or similar gaming content.
-Do NOT confuse game character edits with Movie/Tv/Drama Edits unless clearly from film/TV/anime rather than a game.
-
-19) Fitness
-Definition: Exercise, gym, sport training or physique is central.
-Use for: workout, gym, bodybuilding, flexing muscles, showing physique, fitness transformation, sport training, exercise routine.
-
-20) Remix
-Definition: Audio has been transformed.
-Use ONLY for: sped up, slowed, mashup, DJ edit, remix audio, alternate audio version.
-Do NOT use for: visual transitions, edited clips, fashion transformations, fan edits.
-
-21) Carousel
-Definition: TikTok slideshow/photo carousel format.
-Use when: isSlideshow=true or the post is clearly a sequence of still photos.
-Always include Carousel if isSlideshow=true.
-Best practice: use Carousel + content label, e.g. Carousel + Beauty, Carousel + Quotes, Carousel + Celebrity Edits.
-
-=== COMMON CONFUSIONS TO AVOID ===
-- Dance vs Lip Sync: Dance = choreography/body movement. Lip Sync = mouth/face performance to lyrics.
-- Dance vs Slice of Life: if dancing is visible, do not call it Slice of Life just because setting is casual.
-- Beauty vs Fashion: Beauty = makeup/skincare/hair/nails/cosmetics. Fashion = clothes/outfit/styling.
-- Relationship vs Slice of Life: Relationship = romance/partner/love/longing. Slice of Life = ordinary daily life.
-- Quotes vs Reflection: Quotes = quote text. Reflection = personal introspection/life lesson.
-- Celebrity Edits vs Movie/Tv/Drama Edits: real public figure = Celebrity Edits. Fictional/drama/movie/anime scene = Movie/Tv/Drama Edits.
-- Media/Infotainment vs Slice of Life: if the post teaches, explains, recommends or reports, use Media/Infotainment.
-- Lyrics vs Lip Sync: Lyrics = text shown. Lip Sync = person mouths/sings lyrics.
-
-=== CONFIDENCE GUIDANCE ===
-- 0.90-1.00: clear visual/caption signal.
-- 0.75-0.89: likely correct but some ambiguity.
-- 0.50-0.74: weak signal; should probably be reviewed.
-- <0.50: cannot determine confidently.
-For motion-heavy labels like Dance, Lip Sync, Fitness and Cover, lower confidence if only static frames are available and motion is unclear.
-
-=== CONTENT DETAILS ===
-Write one concise sentence describing what happens visually, including setting, mood, objects, people and visual style.
-
-=== OUTPUT FORMAT ===
-{{"narrative": "<short theme phrase or NA>", "creative_type": ["<label1>", "<label2 optional>"], "content_details": "<one sentence>", "confidence": <float>, "reasoning": "<short reason for Creative Type>"}}"""
+=== OUTPUT FORMAT (JSON only) ===
+{{"narrative": "<word>", "creative_type": ["<label1>"], "content_details": "<sentence>", "confidence": <float>, "reasoning": "<sentence>"}}"""
 
 def call_gemini(contents, gemini_key, max_retries=4):
     from google import genai
@@ -924,14 +729,10 @@ def validate(result):
     if result.get('parse_error'):
         return 'review', 0, ['Parse error']
     narrative = result.get('narrative', '')
-    if isinstance(narrative, list):
-        narrative = ', '.join(str(x).strip() for x in narrative if str(x).strip())
-        result['narrative'] = narrative
-    narrative_clean = str(narrative).strip()
-    if not narrative_clean or narrative_clean in ['null', 'None', '?', '']:
+    if not narrative or narrative in ['null', 'None', '?', '']:
         issues.append('Missing narrative')
-    elif len(narrative_clean.split()) > 7:
-        issues.append(f'Narrative too long: {narrative_clean}')
+    elif len(narrative.split()) > 2:
+        issues.append(f'Narrative too long: {narrative}')
     else:
         score += 1
     ct = result.get('creative_type', [])
@@ -1016,7 +817,7 @@ def build_out(row, vid_id, market, track, result, tier_used, status, score, issu
         'music_name':           (_get('musicMeta.musicName') or (raw_record.get('musicMeta', {}).get('musicName', '') if isinstance(raw_record.get('musicMeta', {}), dict) else '')),
         'music_author':         (_get('musicMeta.musicAuthor') or (raw_record.get('musicMeta', {}).get('musicAuthor', '') if isinstance(raw_record.get('musicMeta', {}), dict) else '')),
         'is_slideshow':         bool(_get('isSlideshow', raw_record.get('isSlideshow', False))),
-        'Narrative':            (', '.join(str(x).strip() for x in result.get('narrative', []) if str(x).strip()) if isinstance(result.get('narrative', ''), list) else str(result.get('narrative', '')).strip()),
+        'Narrative':            result.get('narrative', ''),
         'Creative Type':        ', '.join(result.get('creative_type', [])),
         'Content Details':      result.get('content_details', ''),
         'confidence':           final_conf,
@@ -2639,7 +2440,7 @@ elif page == "Review Flagged":
 
         if st.button("Save & Next", type="primary", use_container_width=True):
             if narrative_choice == 'Custom' and not custom_narrative_value:
-                st.error("Please type a custom narrative, or choose Other/NA if you do not want to type one.")
+                st.error("Please type a custom narrative, or choose Other if you do not want to type one.")
             elif market_unknown and not final_market:
                 st.error("Please select or type the market before saving.")
             elif not narrative or not creative_type or not content_details:
