@@ -248,6 +248,10 @@ ALLOWED_CREATIVE_TYPES = [
 ]
 ALLOWED_SET = set(ALLOWED_CREATIVE_TYPES)
 
+# Default Gemini model. Keep this aligned with your current working setup.
+# If the video fallback fails for your account/model, change this to another video-capable Gemini model available to you.
+GEMINI_MODEL = 'gemini-3.1-flash-lite'
+
 NARRATIVE_OPTIONS = [
     'NA', 'Relationship', 'Friendship', 'Family', 'Lifestyle',
     'Dance', 'Simple Dance', 'Dance Tutorial', 'Lip Sync',
@@ -622,20 +626,138 @@ def download_video(video_url, output_path, apify_token):
         f.write(r.content)
     return output_path
 
-def extract_frames(video_path, output_dir, points=[0.10, 0.50, 0.90]):
+# Frame sampling presets
+# 3-frame mode is fast and works well for static / text / lifestyle content.
+# 9-frame mode gives better temporal coverage for motion-heavy content such as Dance and Lip Sync,
+# but is slower, so v27 uses it only as an adaptive refinement step.
+FRAME_POINTS_3 = [0.10, 0.50, 0.90]
+FRAME_POINTS_9 = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+MOTION_HEAVY_TYPES = {'Dance', 'Lip Sync', 'Fitness', 'Cover'}
+MOTION_CUE_WORDS = [
+    'dance', 'dancing', 'choreo', 'choreography', 'challenge', '댄스', '춤',
+    'cover', 'sing', 'singing', 'lip sync', 'lipsync', 'fitness', 'workout', 'gym'
+]
+
+def extract_frames(video_path, output_dir, points=None):
+    if points is None:
+        points = FRAME_POINTS_3
     os.makedirs(output_dir, exist_ok=True)
     cap   = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_paths = []
+    if total <= 0:
+        cap.release()
+        return frame_paths
     for p in points:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * p))
+        # Clamp position to avoid seeking past the last frame.
+        frame_pos = max(0, min(total - 1, int(total * p)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
         ok, frame = cap.read()
         if ok:
-            path = os.path.join(output_dir, f'frame_{int(p*100)}.jpg')
+            path = os.path.join(output_dir, f'frame_{int(p*100):02d}.jpg')
             cv2.imwrite(path, frame)
             frame_paths.append(path)
     cap.release()
     return frame_paths
+
+def _result_has_motion_heavy_label(result):
+    labels = result.get('creative_type', []) if isinstance(result, dict) else []
+    if not isinstance(labels, list):
+        return False
+    return any(str(x).strip() in MOTION_HEAVY_TYPES for x in labels)
+
+def _row_has_motion_cues(row):
+    try:
+        caption = str(row.get('text', '') or '').lower()
+    except Exception:
+        caption = ''
+    tags_raw = row.get('hashtags', [])
+    tags = []
+    if isinstance(tags_raw, list):
+        for h in tags_raw:
+            tags.append((h.get('name', '') if isinstance(h, dict) else str(h)).lower())
+    text = caption + ' ' + ' '.join(tags)
+    return any(w in text for w in MOTION_CUE_WORDS)
+
+DANCE_VISUAL_CUES = [
+    'dance', 'dancing', 'dancer', 'choreo', 'choreography', 'dance challenge',
+    'synchronized', 'synchronised', 'sync movement', 'coordinated movement',
+    'full-body', 'full body', 'body movement', 'hand gesture', 'dance move',
+    'formation', 'performance', 'group dance', 'dance practice'
+]
+
+NON_DANCE_LIPSYNC_CUES = [
+    'close-up', 'close up', 'mouth', 'mouthing', 'singing to camera',
+    'face expression', 'facial expression', 'little/no choreography', 'no choreography'
+]
+
+def _result_text_blob(result):
+    if not isinstance(result, dict):
+        return ''
+    parts = []
+    for k in ['narrative', 'content_details', 'reasoning']:
+        v = result.get(k, '')
+        if isinstance(v, list):
+            v = ' '.join(map(str, v))
+        parts.append(str(v))
+    labels = result.get('creative_type', [])
+    if isinstance(labels, list):
+        parts.append(' '.join(map(str, labels)))
+    return ' '.join(parts).lower()
+
+def _result_has_dance_visual_cues(result):
+    blob = _result_text_blob(result)
+    return any(cue in blob for cue in DANCE_VISUAL_CUES)
+
+def _result_is_clear_lipsync_only(result):
+    blob = _result_text_blob(result)
+    has_lipsync = ('lip sync' in blob or 'lipsync' in blob or 'mouthing' in blob or 'mouth' in blob)
+    has_dance = any(cue in blob for cue in DANCE_VISUAL_CUES)
+    has_non_dance = any(cue in blob for cue in NON_DANCE_LIPSYNC_CUES)
+    return has_lipsync and has_non_dance and not has_dance
+
+def apply_dance_guardrails(result, row=None):
+    """Post-process obvious Dance/Lip Sync confusion without another Gemini call.
+
+    This is conservative: it only adds/replaces Dance when the model's own
+    narrative/details/reasoning or the caption/hashtags contain dance/choreography cues.
+    It is designed to improve KR-style choreography posts while avoiding PH-style
+    genuine lip-sync posts.
+    """
+    if not isinstance(result, dict) or result.get('parse_error'):
+        return result
+    labels = result.get('creative_type', [])
+    if not isinstance(labels, list):
+        return result
+    labels = [x for x in labels if x in ALLOWED_SET]
+    label_set = set(labels)
+    row_dance_cue = _row_has_motion_cues(row) if row is not None else False
+    result_dance_cue = _result_has_dance_visual_cues(result)
+    clear_lipsync_only = _result_is_clear_lipsync_only(result)
+
+    should_force_dance = (row_dance_cue or result_dance_cue) and not clear_lipsync_only
+
+    if should_force_dance and 'Dance' not in label_set:
+        # If the model predicted Lip Sync/Relationship/Celebrity Edits but its own
+        # description mentions choreography, include Dance. Keep one useful secondary
+        # label only when possible.
+        new_labels = ['Dance']
+        for keep in ['Celebrity Edits', 'Lip Sync', 'Relationship', 'Carousel']:
+            if keep in labels and keep not in new_labels:
+                new_labels.append(keep)
+                break
+        result['creative_type'] = new_labels[:2]
+        old_reason = str(result.get('reasoning', '') or '')
+        result['reasoning'] = (old_reason + ' | Guardrail: dance/choreography cues detected, so Dance was prioritized over Lip Sync/Relationship.').strip(' |')
+        try:
+            result['confidence'] = max(float(result.get('confidence', 0) or 0), 0.78)
+        except Exception:
+            result['confidence'] = 0.78
+    elif 'Dance' in label_set and 'Lip Sync' in label_set and result_dance_cue:
+        # Keep Dance first when both labels are present.
+        rest = [x for x in labels if x != 'Dance']
+        result['creative_type'] = ['Dance'] + rest[:1]
+    return result
 
 def build_prompt(row):
     caption    = row.get('text', '')
@@ -677,7 +799,8 @@ Ask: "What type of TikTok content is this?" rather than "What objects appear in 
 
 Examples:
 - A person dancing in a mall is Dance, not Slice of Life.
-- A person mouthing lyrics in a bedroom is Lip Sync, not Slice of Life.
+- Full-body choreography or synchronized movement is Dance, even if the caption is romantic or the creator mouths lyrics.
+- A person mouthing lyrics in a bedroom is Lip Sync only when mouth/face performance is the main action and there is little/no choreography.
 - A drama/anime/movie scene edit is Movie/Tv/Drama Edits, not Slice of Life.
 - A K-pop idol photo/video montage is Celebrity Edits, not Slice of Life.
 - A makeup routine is Beauty, not Fashion, even if the outfit is nice.
@@ -721,8 +844,8 @@ Do not force narrative into one label like Relationship or Lifestyle if a more s
 1. Is this a slideshow/photo carousel? If yes, include Carousel.
 2. Is the main content from a movie, drama, TV show, anime, web series or fictional scene? Use Movie/Tv/Drama Edits.
 3. Is the main content a fan edit/montage of a real celebrity, idol, singer, actor, athlete, influencer or public figure? Use Celebrity Edits.
-4. Is visible choreography/dance performance the main focus? Use Dance.
-5. Is the creator mainly mouthing/singing lyrics or acting to audio with little/no choreography? Use Lip Sync.
+4. Is visible choreography, repeated body movement, dance challenge, or synchronized/group movement the main focus? Use Dance.
+5. Is the creator mainly mouthing/singing lyrics with little/no choreography? Use Lip Sync. If choreography is visible, Dance wins over Lip Sync.
 6. Is the creator performing a cover, singing/playing an instrument as their own performance? Use Cover.
 7. Is the main focus makeup, skincare, hair, nails or cosmetics? Use Beauty.
 8. Is the main focus clothing, outfit styling, OOTD, fit check or fashion haul? Use Fashion.
@@ -748,13 +871,16 @@ Do NOT confuse with:
 - Slice of Life: everyday location does not matter if the main action is dancing.
 - Celebrity Edits: if the video is mainly an idol/celebrity montage, use Celebrity Edits; if it is a creator or group performing choreography, use Dance.
 Rule: If visible body movement/choreography is a major focus, classify as Dance even if captions are vague.
-Motion note: because only sampled frames may be available, if multiple frames show dance pose/choreography, choose Dance.
+Priority rule: Dance OVERRIDES Lip Sync, Relationship and Slice of Life when the visual format is choreography/performance.
+Korea/K-pop rule: If idol/creator content shows a dance challenge, practice, choreography, performance stage, hand-gesture dance or synchronized group movement, choose Dance. Use Celebrity Edits only when it is mainly a fan montage/edit rather than the dance itself.
+Motion note: because only sampled frames may be available, look for progression across frames. If multiple frames show full-body poses, synchronized movement, dance formation or choreography, choose Dance even if the caption is romantic or the creator appears to be mouthing lyrics.
 
 2) Lip Sync
 Definition: Creator mouths lyrics/dialogue or sings along to the audio.
 Use for: singing along, mouthing lyrics, emotional lip-sync performance, acting to lyrics/dialogue, close-up singing to camera.
 Do NOT use when: full-body choreography is dominant -> Dance.
-Rule: If the main performance is face/mouth expression rather than choreography, choose Lip Sync.
+Rule: If the main performance is face/mouth expression rather than choreography, choose Lip Sync. If full-body movement/choreography is visible across frames, choose Dance instead of Lip Sync.
+Do NOT classify as Lip Sync just because the creator's mouth is open or music has lyrics. Lip Sync requires mouth/face performance to be the dominant format.
 
 3) Cover
 Definition: Creator performs their own musical cover.
@@ -814,7 +940,7 @@ Rule: If the caption/on-screen text sets up a scenario such as "POV: ...", use P
 Definition: Main purpose is humour.
 Use for: joke, meme, prank, funny skit, humorous acting, exaggerated reaction, comedic situation.
 Can combine with: POV.
-Do NOT use if the content is only light-hearted but not primarily funny.
+Do NOT use if the content is only light-hearted but not primarily funny. Do NOT classify a skit as Lip Sync just because music is playing; if the creator is acting/talking for humour, choose Comedy.
 
 12) Lyrics
 Definition: Original song lyrics are visibly displayed or are the central content.
@@ -899,7 +1025,7 @@ def call_gemini(contents, gemini_key, max_retries=4):
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model='gemini-3.1-flash-lite',
+                model=GEMINI_MODEL,
                 contents=contents,
                 config=types.GenerateContentConfig(response_mime_type='application/json')
             )
@@ -918,6 +1044,95 @@ def call_gemini(contents, gemini_key, max_retries=4):
             else:
                 return {'parse_error': True, 'raw_response': err, 'needs_human_review': True}
     return {'parse_error': True, 'raw_response': 'Max retries exceeded', 'needs_human_review': True}
+
+def call_gemini_video_file(video_path, prompt, gemini_key, max_retries=3):
+    """Send the full video file to Gemini as a final AI fallback.
+
+    This is intentionally used sparingly because uploading and analysing a video
+    is slower and consumes more quota than frame-based analysis.
+    """
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=gemini_key)
+    uploaded = None
+    try:
+        uploaded = client.files.upload(file=video_path)
+
+        # Videos can need a short processing period before they are usable.
+        for _ in range(30):
+            try:
+                uploaded = client.files.get(name=uploaded.name)
+                state = getattr(uploaded, 'state', None)
+                state_name = getattr(state, 'name', str(state)).upper()
+                if 'ACTIVE' in state_name or 'SUCCEEDED' in state_name or 'READY' in state_name:
+                    break
+                if 'FAILED' in state_name:
+                    return {'parse_error': True, 'raw_response': 'Video file processing failed', 'needs_human_review': True}
+            except Exception:
+                # Some SDK versions return immediately usable file handles.
+                break
+            time.sleep(2)
+
+        video_prompt = prompt + """
+
+FULL VIDEO FALLBACK:
+You are now given the full video, not just still frames.
+Focus on temporal motion and sequence of actions.
+For Dance vs Lip Sync:
+- Dance = full-body or upper-body choreography, repeated moves, synchronized/group movement, dance challenge, dance practice/performance.
+- Lip Sync = mainly mouth/face performance to lyrics/dialogue, with little or no choreography.
+If choreography is visible across time, prioritise Dance over Lip Sync.
+Return the same JSON schema only.
+"""
+
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[video_prompt, uploaded],
+                    config=types.GenerateContentConfig(response_mime_type='application/json')
+                )
+                text = response.text.strip()
+                text = re.sub(r'^```json\s*', '', text)
+                text = re.sub(r'```$', '', text).strip()
+                return json.loads(text)
+            except Exception as e:
+                err = str(e)
+                if '429' in err or 'RESOURCE_EXHAUSTED' in err:
+                    time.sleep(90*(attempt+1) + random.randint(0,15))
+                elif '503' in err or 'UNAVAILABLE' in err:
+                    time.sleep(20*(attempt+1) + random.randint(0,10))
+                else:
+                    return {'parse_error': True, 'raw_response': err, 'needs_human_review': True}
+        return {'parse_error': True, 'raw_response': 'Max retries exceeded in video fallback', 'needs_human_review': True}
+    except Exception as e:
+        return {'parse_error': True, 'raw_response': f'Video fallback failed: {e}', 'needs_human_review': True}
+    finally:
+        # Best-effort cleanup. Not all SDK/account modes support delete.
+        try:
+            if uploaded is not None:
+                client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+def _should_try_video_fallback(row, result, status):
+    """Use full-video analysis only for likely motion ambiguity, to protect quota."""
+    try:
+        conf = float(result.get('confidence', 0) or 0)
+    except Exception:
+        conf = 0
+    labels = result.get('creative_type', []) if isinstance(result, dict) else []
+    labels = set(labels) if isinstance(labels, list) else set()
+    row_motion = _row_has_motion_cues(row)
+    result_dance_cues = _result_has_dance_visual_cues(result)
+    motion_label = bool(labels & MOTION_HEAVY_TYPES)
+    possible_dance_lipsync_confusion = ('Lip Sync' in labels and (row_motion or result_dance_cues))
+    return (
+        status == 'review'
+        or conf < 0.70
+        or possible_dance_lipsync_confusion
+        or (motion_label and conf < 0.82)
+    )
 
 def validate(result):
     issues, score = [], 0
@@ -1196,27 +1411,86 @@ def run_pipeline(records, track, gemini_key, apify_token, log_list, delay_second
             contents = [prompt]
 
         result = call_gemini(contents, gemini_key)
+        result = apply_dance_guardrails(result, row)
         result['tier_used'] = 'tier1_cover'
         status, score, issues = validate(result)
 
         if status == 'review' or result.get('confidence', 0) < 0.75:
-            log_list.append("  → Tier 2 (video frames)...")
+            log_list.append("  → Tier 2A (3 video frames)...")
             video_url = get_video_url(row)
             if video_url:
                 try:
                     with tempfile.TemporaryDirectory() as tmp:
                         video_path = os.path.join(tmp, f'{vid_id}.mp4')
                         download_video(video_url, video_path, apify_token)
-                        frame_paths = extract_frames(video_path, os.path.join(tmp, 'frames'))
+
+                        # Tier 2A: fast default pass using 3 frames.
+                        frame_paths = extract_frames(video_path, os.path.join(tmp, 'frames_3'), FRAME_POINTS_3)
                         contents2 = [prompt]
                         for fp in frame_paths:
                             with open(fp, 'rb') as f:
                                 contents2.append(gtypes.Part.from_bytes(data=f.read(), mime_type='image/jpeg'))
                         result2 = call_gemini(contents2, gemini_key)
-                        result2['tier_used'] = 'tier2_frames'
+                        result2 = apply_dance_guardrails(result2, row)
+                        result2['tier_used'] = 'tier2a_3frames'
                         status2, score2, issues2 = validate(result2)
                         if score2 >= score or result.get('parse_error'):
                             result, status, score, issues = result2, status2, score2, issues2
+
+                        # Tier 2B: adaptive motion refinement.
+                        # Only run the slower 9-frame pass when the content is likely motion-heavy
+                        # or the 3-frame result is still weak. This is designed to help KR/Dance
+                        # without slowing every PH-style Lip Sync / Relationship / Quote post.
+                        should_refine_motion = (
+                            # Avoid spending 9-frame calls on every genuine PH-style Lip Sync.
+                            # Refine when there are dance/choreography cues, an initial Dance/Fitness/Cover label,
+                            # or the 3-frame result is still weak/invalid.
+                            _row_has_motion_cues(row)
+                            or _result_has_dance_visual_cues(result2)
+                            or any(x in set(result2.get('creative_type', [])) for x in ['Dance', 'Fitness', 'Cover'])
+                            or status2 == 'review'
+                            or result2.get('confidence', 0) < 0.75
+                        )
+                        if should_refine_motion:
+                            log_list.append("  → Tier 2B (adaptive 9-frame motion refinement)...")
+                            frame_paths_9 = extract_frames(video_path, os.path.join(tmp, 'frames_9'), FRAME_POINTS_9)
+                            contents9 = [prompt + "\n\nMotion-aware refinement: analyse the sequence of frames carefully. If full-body choreography or repeated body movement is visible across frames, prioritise Dance over Lip Sync or Relationship. Use Lip Sync only when mouth/face performance is the main action and there is little/no choreography."]
+                            for fp in frame_paths_9:
+                                with open(fp, 'rb') as f:
+                                    contents9.append(gtypes.Part.from_bytes(data=f.read(), mime_type='image/jpeg'))
+                            result9 = call_gemini(contents9, gemini_key)
+                            result9 = apply_dance_guardrails(result9, row)
+                            result9['tier_used'] = 'tier2b_9frames_adaptive'
+                            status9, score9, issues9 = validate(result9)
+                            # Prefer 9-frame result only when it is clearly stronger or fixes a failed/low-confidence result.
+                            if (
+                                score9 > score
+                                or result.get('parse_error')
+                                or (status != 'pass' and status9 == 'pass')
+                                or (result9.get('confidence', 0) >= result.get('confidence', 0) + 0.10)
+                            ):
+                                result, status, score, issues = result9, status9, score9, issues9
+
+                        # Tier 2C: full-video fallback, used only for unresolved motion-heavy ambiguity.
+                        # This is slower and consumes more quota, so it is deliberately conservative.
+                        if _should_try_video_fallback(row, result, status):
+                            log_list.append("  → Tier 2C (full video fallback, motion ambiguity only)...")
+                            video_prompt = prompt + "\n\nUse the full video to resolve motion ambiguity. If choreography is visible over time, choose Dance over Lip Sync."
+                            resultv = call_gemini_video_file(video_path, video_prompt, gemini_key)
+                            resultv = apply_dance_guardrails(resultv, row)
+                            resultv['tier_used'] = 'tier2c_full_video'
+                            statusv, scorev, issuesv = validate(resultv)
+                            # Prefer full-video result when it passes validation and is at least as strong,
+                            # or when it fixes a low-confidence/review result.
+                            if (
+                                not resultv.get('parse_error')
+                                and (
+                                    scorev > score
+                                    or (status != 'pass' and statusv == 'pass')
+                                    or (resultv.get('confidence', 0) >= max(0.75, result.get('confidence', 0) + 0.05))
+                                )
+                            ):
+                                result, status, score, issues = resultv, statusv, scorev, issuesv
                 except Exception as e:
                     log_list.append(f"  → Tier 2 failed: {e}")
 
@@ -2019,7 +2293,7 @@ elif page == "Upload & Tag":
                 <div><div class='big'>{video_ready}/{len(run_configs)}</div><div class='label'>Video Links</div></div>
                 <div><div class='big'>~{est_min}m</div><div class='label'>Est. Time</div></div>
             </div>
-            <div class='small-muted'>Tier 0V: visual-only for vague captions · Tier 1: cover image · Tier 2: video frames on low confidence</div>
+            <div class='small-muted'>Tier 0V: visual-only for vague captions · Tier 1: cover image · Tier 2A: 3 frames · Tier 2B: adaptive 9-frame refinement</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -2534,6 +2808,7 @@ elif page == "Review Flagged":
                         except Exception:
                             pass
                     suggest_result = call_gemini(contents_suggest, gemini_key_r)
+                    suggest_result = apply_dance_guardrails(suggest_result, source_row)
                     st.session_state[ai_result_key] = suggest_result
 
         # Pre-fill defaults from AI suggestion if available

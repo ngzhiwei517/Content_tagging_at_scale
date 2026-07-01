@@ -248,10 +248,19 @@ ALLOWED_CREATIVE_TYPES = [
 ]
 ALLOWED_SET = set(ALLOWED_CREATIVE_TYPES)
 
+# Default Gemini model. Keep this aligned with your current working setup.
+# If the video fallback fails for your account/model, change this to another video-capable Gemini model available to you.
+GEMINI_MODEL = 'gemini-3.1-flash-lite'
+
 NARRATIVE_OPTIONS = [
-    'CNY', 'Relationship', 'Friendship', 'Family', 'Fashion',
-    'Dance', 'Food', 'Travel', 'Fitness', 'Comedy',
-    'Reflection', 'Quotes', 'Lifestyle', 'Custom', 'Other'
+    'NA', 'Relationship', 'Friendship', 'Family', 'Lifestyle',
+    'Dance', 'Simple Dance', 'Dance Tutorial', 'Lip Sync',
+    'Fashion', 'Beauty', 'Product Showcase', 'Tutorial',
+    'Travel', 'Beach Vacation', 'Food', 'Fitness', 'Comedy',
+    'Reflection', 'Healing', 'Quotes', 'Motivation',
+    'Celebrity Edit', 'Drama Edit', 'Gaming', 'Celebration',
+    'Study', 'Work', 'Pets', 'CNY', 'Ramadan',
+    'Custom', 'Other'
 ]
 
 VAGUE_PATTERNS = [r'^[\W\s\d]+$', r'^.{0,15}$']
@@ -617,20 +626,138 @@ def download_video(video_url, output_path, apify_token):
         f.write(r.content)
     return output_path
 
-def extract_frames(video_path, output_dir, points=[0.10, 0.50, 0.90]):
+# Frame sampling presets
+# 3-frame mode is fast and works well for static / text / lifestyle content.
+# 9-frame mode gives better temporal coverage for motion-heavy content such as Dance and Lip Sync,
+# but is slower, so v27 uses it only as an adaptive refinement step.
+FRAME_POINTS_3 = [0.10, 0.50, 0.90]
+FRAME_POINTS_9 = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+MOTION_HEAVY_TYPES = {'Dance', 'Lip Sync', 'Fitness', 'Cover'}
+MOTION_CUE_WORDS = [
+    'dance', 'dancing', 'choreo', 'choreography', 'challenge', '댄스', '춤',
+    'cover', 'sing', 'singing', 'lip sync', 'lipsync', 'fitness', 'workout', 'gym'
+]
+
+def extract_frames(video_path, output_dir, points=None):
+    if points is None:
+        points = FRAME_POINTS_3
     os.makedirs(output_dir, exist_ok=True)
     cap   = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_paths = []
+    if total <= 0:
+        cap.release()
+        return frame_paths
     for p in points:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * p))
+        # Clamp position to avoid seeking past the last frame.
+        frame_pos = max(0, min(total - 1, int(total * p)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
         ok, frame = cap.read()
         if ok:
-            path = os.path.join(output_dir, f'frame_{int(p*100)}.jpg')
+            path = os.path.join(output_dir, f'frame_{int(p*100):02d}.jpg')
             cv2.imwrite(path, frame)
             frame_paths.append(path)
     cap.release()
     return frame_paths
+
+def _result_has_motion_heavy_label(result):
+    labels = result.get('creative_type', []) if isinstance(result, dict) else []
+    if not isinstance(labels, list):
+        return False
+    return any(str(x).strip() in MOTION_HEAVY_TYPES for x in labels)
+
+def _row_has_motion_cues(row):
+    try:
+        caption = str(row.get('text', '') or '').lower()
+    except Exception:
+        caption = ''
+    tags_raw = row.get('hashtags', [])
+    tags = []
+    if isinstance(tags_raw, list):
+        for h in tags_raw:
+            tags.append((h.get('name', '') if isinstance(h, dict) else str(h)).lower())
+    text = caption + ' ' + ' '.join(tags)
+    return any(w in text for w in MOTION_CUE_WORDS)
+
+DANCE_VISUAL_CUES = [
+    'dance', 'dancing', 'dancer', 'choreo', 'choreography', 'dance challenge',
+    'synchronized', 'synchronised', 'sync movement', 'coordinated movement',
+    'full-body', 'full body', 'body movement', 'hand gesture', 'dance move',
+    'formation', 'performance', 'group dance', 'dance practice'
+]
+
+NON_DANCE_LIPSYNC_CUES = [
+    'close-up', 'close up', 'mouth', 'mouthing', 'singing to camera',
+    'face expression', 'facial expression', 'little/no choreography', 'no choreography'
+]
+
+def _result_text_blob(result):
+    if not isinstance(result, dict):
+        return ''
+    parts = []
+    for k in ['narrative', 'content_details', 'reasoning']:
+        v = result.get(k, '')
+        if isinstance(v, list):
+            v = ' '.join(map(str, v))
+        parts.append(str(v))
+    labels = result.get('creative_type', [])
+    if isinstance(labels, list):
+        parts.append(' '.join(map(str, labels)))
+    return ' '.join(parts).lower()
+
+def _result_has_dance_visual_cues(result):
+    blob = _result_text_blob(result)
+    return any(cue in blob for cue in DANCE_VISUAL_CUES)
+
+def _result_is_clear_lipsync_only(result):
+    blob = _result_text_blob(result)
+    has_lipsync = ('lip sync' in blob or 'lipsync' in blob or 'mouthing' in blob or 'mouth' in blob)
+    has_dance = any(cue in blob for cue in DANCE_VISUAL_CUES)
+    has_non_dance = any(cue in blob for cue in NON_DANCE_LIPSYNC_CUES)
+    return has_lipsync and has_non_dance and not has_dance
+
+def apply_dance_guardrails(result, row=None):
+    """Post-process obvious Dance/Lip Sync confusion without another Gemini call.
+
+    This is conservative: it only adds/replaces Dance when the model's own
+    narrative/details/reasoning or the caption/hashtags contain dance/choreography cues.
+    It is designed to improve KR-style choreography posts while avoiding PH-style
+    genuine lip-sync posts.
+    """
+    if not isinstance(result, dict) or result.get('parse_error'):
+        return result
+    labels = result.get('creative_type', [])
+    if not isinstance(labels, list):
+        return result
+    labels = [x for x in labels if x in ALLOWED_SET]
+    label_set = set(labels)
+    row_dance_cue = _row_has_motion_cues(row) if row is not None else False
+    result_dance_cue = _result_has_dance_visual_cues(result)
+    clear_lipsync_only = _result_is_clear_lipsync_only(result)
+
+    should_force_dance = (row_dance_cue or result_dance_cue) and not clear_lipsync_only
+
+    if should_force_dance and 'Dance' not in label_set:
+        # If the model predicted Lip Sync/Relationship/Celebrity Edits but its own
+        # description mentions choreography, include Dance. Keep one useful secondary
+        # label only when possible.
+        new_labels = ['Dance']
+        for keep in ['Celebrity Edits', 'Lip Sync', 'Relationship', 'Carousel']:
+            if keep in labels and keep not in new_labels:
+                new_labels.append(keep)
+                break
+        result['creative_type'] = new_labels[:2]
+        old_reason = str(result.get('reasoning', '') or '')
+        result['reasoning'] = (old_reason + ' | Guardrail: dance/choreography cues detected, so Dance was prioritized over Lip Sync/Relationship.').strip(' |')
+        try:
+            result['confidence'] = max(float(result.get('confidence', 0) or 0), 0.78)
+        except Exception:
+            result['confidence'] = 0.78
+    elif 'Dance' in label_set and 'Lip Sync' in label_set and result_dance_cue:
+        # Keep Dance first when both labels are present.
+        rest = [x for x in labels if x != 'Dance']
+        result['creative_type'] = ['Dance'] + rest[:1]
+    return result
 
 def build_prompt(row):
     caption    = row.get('text', '')
@@ -649,8 +776,10 @@ def build_prompt(row):
     saves      = row.get('collectCount', 0)
     is_slide   = row.get('isSlideshow', False)
     allowed_str = '\n'.join(f'  - {t}' for t in ALLOWED_CREATIVE_TYPES)
-    return f"""You are a TikTok content analyst for a music marketing project covering SEA and Korean markets.
-Analyse this TikTok post. Return ONLY valid JSON — no markdown, no explanation.
+    return f"""You are a senior TikTok UGC content analyst for Universal Music Group.
+Your task is to classify TikTok posts for music marketing analysis across Malaysia, Philippines, Singapore, Korea, Thailand, Vietnam and wider SEA markets.
+
+Return ONLY valid JSON. No markdown. No explanation outside JSON.
 
 === POST METADATA ===
 Caption: {caption}
@@ -660,42 +789,234 @@ Music: {music} by {music_auth}
 Duration: {duration}s | Market: {location} | Is Slideshow: {is_slide}
 Plays: {play:,} | Likes: {likes:,} | Shares: {shares:,} | Saves: {saves:,}
 
-=== ALLOWED CREATIVE TYPE LABELS (exact spelling required) ===
+=== ALLOWED CREATIVE TYPE LABELS ===
+Use exact spelling only:
 {allowed_str}
 
-=== TAGGING RULES ===
-NARRATIVE (one word):
-- CNY: Chinese/Lunar New Year, qipao, ang pao, red packets, festive outfits, CNY family/friend scenes, zodiac/horoscope for new year
-- Relationship: couple content, love stories, boyfriend/girlfriend
-- Friendship: friend groups, bestie content, squad
-- Family: parent-child, siblings, home life
-- Fashion: OOTD, styling, lookbook, outfit showcase
-- Dance: dance challenge, choreography tutorial
-- Food: cooking, eating, restaurant
-- Travel: places, trips, tourism
-- Fitness: workout, gym, exercise
-- Comedy: funny, prank, skit
+=== VERY IMPORTANT CLASSIFICATION PRINCIPLE ===
+Do NOT simply describe the scene. Classify the PRIMARY CONTENT FORMAT.
+Ask: "What type of TikTok content is this?" rather than "What objects appear in the frame?"
 
-CREATIVE TYPE (1-2 labels, exact spelling):
-- Outfit showcase / OOTD / styling / lookbook → Fashion
-- Makeup tutorial / skincare / beauty transformation → Beauty
-- Dance challenge / choreography / dance tutorial → Dance
-- Photo slideshow / isSlideshow=true → Carousel
-- Couple trend / relationship POV → Relationship
-- Singing along to song → Lip Sync
-- Lyrics displayed on screen → Lyrics or Lyrics Translation
-- Everyday moments / personal storytelling → Slice of Life
-- Reaction / news / education / explainer → Media/Infotainment
-- Horoscope / forecast / zodiac → Media/Infotainment
-- Funny skit / prank / comedy → Comedy
-- Remix: ONLY if audio is clearly sped up/slowed down/mashup. NEVER for fashion rework or visual transitions.
+Examples:
+- A person dancing in a mall is Dance, not Slice of Life.
+- Full-body choreography or synchronized movement is Dance, even if the caption is romantic or the creator mouths lyrics.
+- A person mouthing lyrics in a bedroom is Lip Sync only when mouth/face performance is the main action and there is little/no choreography.
+- A drama/anime/movie scene edit is Movie/Tv/Drama Edits, not Slice of Life.
+- A K-pop idol photo/video montage is Celebrity Edits, not Slice of Life.
+- A makeup routine is Beauty, not Fashion, even if the outfit is nice.
 
-CONTENT DETAILS (one sentence): Describe what happens + visual aesthetic. Mention colours, transitions, setting, mood.
-CONFIDENCE (0.0-1.0): 0.9-1.0 clear signal, 0.7-0.8 some signal, <0.7 vague, 0.0 cannot determine.
-REASONING: one short sentence.
+=== OUTPUT RULES ===
+- Creative Type: return 1 or 2 labels only.
+- If isSlideshow=true, ALWAYS include Carousel as one label.
+- If Carousel is included, use the second label for the actual content type when possible, e.g. ["Carousel", "Beauty"].
+- Do not use Slice of Life as a fallback when a more specific label applies.
+- If uncertain, choose the strongest visible signal and lower confidence.
+- Remix is audio-only. Never use Remix for visual transitions, outfit changes, or editing style.
 
-=== OUTPUT FORMAT (JSON only) ===
-{{"narrative": "<word>", "creative_type": ["<label1>"], "content_details": "<sentence>", "confidence": <float>, "reasoning": "<sentence>"}}"""
+=== NARRATIVE RULES ===
+Narrative is a short flexible theme phrase, NOT a fixed category.
+Write 1 to 5 words.
+Use NA only if no meaningful theme is visible.
+
+Good narrative examples:
+- Simple dance
+- Girl lip syncing
+- Dance tutorial
+- Idol edit
+- Drama edit
+- Beach vacation
+- Makeup routine
+- Product showcase
+- Rainy walk
+- Late night conversation
+- Missing someone
+- Campus life
+- Outfit showcase
+- Game edit
+- Healing
+- Relationship quote
+- Fitness flex
+- Cooking tutorial
+
+Do not force narrative into one label like Relationship or Lifestyle if a more specific short phrase fits.
+
+=== DECISION TREE — APPLY IN THIS ORDER ===
+1. Is this a slideshow/photo carousel? If yes, include Carousel.
+2. Is the main content from a movie, drama, TV show, anime, web series or fictional scene? Use Movie/Tv/Drama Edits.
+3. Is the main content a fan edit/montage of a real celebrity, idol, singer, actor, athlete, influencer or public figure? Use Celebrity Edits.
+4. Is visible choreography, repeated body movement, dance challenge, or synchronized/group movement the main focus? Use Dance.
+5. Is the creator mainly mouthing/singing lyrics with little/no choreography? Use Lip Sync. If choreography is visible, Dance wins over Lip Sync.
+6. Is the creator performing a cover, singing/playing an instrument as their own performance? Use Cover.
+7. Is the main focus makeup, skincare, hair, nails or cosmetics? Use Beauty.
+8. Is the main focus clothing, outfit styling, OOTD, fit check or fashion haul? Use Fashion.
+9. Is the main message romantic love, longing, heartbreak, partner dynamics or affection for someone special? Use Relationship.
+10. Is it a first-person acted scenario or "POV" setup? Use POV, optionally with Comedy or Relationship.
+11. Is the main purpose humour, joke, meme, prank or comedic skit? Use Comedy.
+12. Are lyrics visibly displayed as the main content? Use Lyrics. If translated/bilingual lyrics are shown, use Lyrics Translation.
+13. Is the post educational/informative/tutorial/review/news/tips/DIY/product recommendation? Use Media/Infotainment.
+14. Is the main visual focus destination/scenery/vacation/travel vlog? Use Travel.
+15. Is the main focus gameplay/game UI/game characters/game edit? Use Gaming.
+16. Is the main focus workout, gym, sport training, physique, exercise or flexing? Use Fitness.
+17. Is it mainly a quote card/text quote? Use Quotes.
+18. Is it personal introspection, self-growth, emotional reflection or life lesson? Use Reflection.
+19. Is it ordinary daily life without a stronger specific label? Use Slice of Life.
+
+=== CREATIVE TYPE HANDBOOK ===
+
+1) Dance
+Definition: Dance performance or choreography is the dominant content format.
+Use for: dance challenge, choreography, hand gesture dance, group dance, idol dance challenge, dance tutorial, dance practice, dance trend.
+Do NOT confuse with:
+- Lip Sync: mouth movement/singing with no dominant choreography.
+- Slice of Life: everyday location does not matter if the main action is dancing.
+- Celebrity Edits: if the video is mainly an idol/celebrity montage, use Celebrity Edits; if it is a creator or group performing choreography, use Dance.
+Rule: If visible body movement/choreography is a major focus, classify as Dance even if captions are vague.
+Priority rule: Dance OVERRIDES Lip Sync, Relationship and Slice of Life when the visual format is choreography/performance.
+Korea/K-pop rule: If idol/creator content shows a dance challenge, practice, choreography, performance stage, hand-gesture dance or synchronized group movement, choose Dance. Use Celebrity Edits only when it is mainly a fan montage/edit rather than the dance itself.
+Motion note: because only sampled frames may be available, look for progression across frames. If multiple frames show full-body poses, synchronized movement, dance formation or choreography, choose Dance even if the caption is romantic or the creator appears to be mouthing lyrics.
+
+2) Lip Sync
+Definition: Creator mouths lyrics/dialogue or sings along to the audio.
+Use for: singing along, mouthing lyrics, emotional lip-sync performance, acting to lyrics/dialogue, close-up singing to camera.
+Do NOT use when: full-body choreography is dominant -> Dance.
+Rule: If the main performance is face/mouth expression rather than choreography, choose Lip Sync. If full-body movement/choreography is visible across frames, choose Dance instead of Lip Sync.
+Do NOT classify as Lip Sync just because the creator's mouth is open or music has lyrics. Lip Sync requires mouth/face performance to be the dominant format.
+
+3) Cover
+Definition: Creator performs their own musical cover.
+Use for: singing cover, instrument cover, acoustic performance, piano/guitar/drum cover, vocal performance not just mouthing existing audio.
+Do NOT confuse with Lip Sync: Lip Sync = mouthing existing audio; Cover = creator performs the song.
+
+4) Movie/Tv/Drama Edits
+Definition: Edits or clips centered on fictional media.
+Use for: movie scenes, TV scenes, drama clips, K-drama edits, anime edits, fictional character edits, series montage, cinematic scene compilations.
+Do NOT confuse with:
+- Celebrity Edits: real celebrity/idol/public figure fan edit.
+- Slice of Life: fictional clips are never Slice of Life.
+Rule: If the content comes from a movie/show/drama/anime/fictional scene, choose Movie/Tv/Drama Edits.
+
+5) Celebrity Edits
+Definition: Fan edit or montage of a real public figure.
+Use for: K-pop idol edits, celebrity photos/videos, actor/artist/athlete montage, fancam edit, concert/performance edit, public figure compilation, F1 driver edit.
+Do NOT confuse with:
+- Movie/Tv/Drama Edits: fictional character/scene from drama/movie/anime.
+- Dance: if the main focus is a creator dancing, choose Dance; if it is a fan edit of an idol/celebrity, choose Celebrity Edits.
+Rule: If the subject is a real famous/public person and the format is edit/montage/fan content, choose Celebrity Edits.
+
+6) Beauty
+Definition: Makeup, skincare, hair, nails or cosmetics are the main focus.
+Use for: makeup routine, makeup tutorial, GRWM makeup, skincare products, skincare routine, eye makeup, lip makeup, hair tutorial, hairstyle transformation, nail art, beauty product carousel, cosmetic review.
+Do NOT use Beauty just because someone looks attractive.
+Do NOT confuse with Fashion: Fashion requires clothing/outfit to be the focus.
+Rule: If cosmetics/hair/skin/nails are the main action or product, choose Beauty.
+
+7) Fashion
+Definition: Clothing/outfit/styling is the main focus.
+Use for: OOTD, fit check, outfit showcase, outfit transition, clothing haul, lookbook, styling tips, accessories when styling is primary, mirror outfit check.
+Do NOT confuse with Beauty: makeup/skincare/hair/nails -> Beauty.
+Rule: If the video showcases what someone is wearing, choose Fashion.
+
+8) Relationship
+Definition: Romantic love, affection, longing, heartbreak, devotion or partner dynamics are central.
+Use for: couple content, boyfriend/girlfriend, husband/wife, missing someone, romantic quotes, affection for someone special, late-night conversation with someone special, relationship advice, emotional openness between partners, heartbreak.
+Do NOT use for ordinary daily memories unless romance is the main message.
+Rule: If the emotional meaning is about love/romance/partner, choose Relationship.
+
+9) Slice of Life
+Definition: Everyday real-life moments without a stronger specific format.
+Use for: daily routine, walking, studying, commuting, coffee, rain scenes, home life, casual memories, school/campus life, lifestyle montage, aesthetic ordinary life.
+Do NOT use as a default.
+Do NOT use when Dance, Lip Sync, Beauty, Fashion, Relationship, Travel, POV, Celebrity Edits or Movie/Tv/Drama Edits clearly apply.
+Rule: Slice of Life is only for ordinary life content with no more specific label.
+
+10) POV
+Definition: First-person scenario, roleplay, acted hypothetical, or explicit "POV:" framing.
+Use for: POV text, acted situation, scenario from viewer perspective, relationship POV, funny POV.
+Can combine with: Comedy, Relationship.
+Do NOT confuse with Slice of Life: if it is acted/framed as a scenario, choose POV.
+Rule: If the caption/on-screen text sets up a scenario such as "POV: ...", use POV.
+
+11) Comedy
+Definition: Main purpose is humour.
+Use for: joke, meme, prank, funny skit, humorous acting, exaggerated reaction, comedic situation.
+Can combine with: POV.
+Do NOT use if the content is only light-hearted but not primarily funny. Do NOT classify a skit as Lip Sync just because music is playing; if the creator is acting/talking for humour, choose Comedy.
+
+12) Lyrics
+Definition: Original song lyrics are visibly displayed or are the central content.
+Use for: lyric video, lyric edit, karaoke-style text, emotional lyric text, post built around written lyrics.
+Do NOT use merely because the audio has lyrics.
+Rule: Lyrics must be visible or captionally central.
+
+13) Lyrics Translation
+Definition: Lyrics are translated into another language.
+Use for: bilingual lyrics, subtitle translation, translated lyric explanation.
+Rule: If both original lyrics and translated text are shown, choose Lyrics Translation.
+
+14) Quotes
+Definition: Standalone quote/saying is the main content.
+Use for: motivational quote, emotional quote, aesthetic quote card, relationship quote, short saying, text quote slideshow.
+Do NOT confuse with Reflection:
+- Quotes = presenting a quote/line.
+- Reflection = personal introspection or life lesson.
+
+15) Reflection
+Definition: Personal introspection, self-growth, emotional reflection or life lesson.
+Use for: self-acceptance, healing, mother's sacrifice, gratitude, sadness, personal realization, life lesson, emotional thoughts.
+Do NOT confuse with Quotes if the post only displays a quote without personal introspection.
+
+16) Media/Infotainment
+Definition: Informational, educational, explanatory, tutorial, review, news, DIY, tip-based or recommendation content.
+Use for: news article, facts, explainer, how-to, DIY, tutorial, recipe/cake idea, product recommendation, digicam review, horoscope/forecast, Valentine's bracelet idea.
+Do NOT confuse with Slice of Life: if it teaches/informs/recommends something, use Media/Infotainment.
+
+17) Travel
+Definition: Travel/destination/scenery is the main focus.
+Use for: beach, mountains, city view, vacation, tourism, trip vlog, landscape, destination montage, travel memory.
+Rule: If the visual focus is place/scenery/trip, choose Travel even if caption is emotional.
+
+18) Gaming
+Definition: Game-related content is central.
+Use for: gameplay, game screenshots, game UI, game character edit, game fan video, Minecraft, Genshin, Racing Master, Omori or similar gaming content.
+Do NOT confuse game character edits with Movie/Tv/Drama Edits unless clearly from film/TV/anime rather than a game.
+
+19) Fitness
+Definition: Exercise, gym, sport training or physique is central.
+Use for: workout, gym, bodybuilding, flexing muscles, showing physique, fitness transformation, sport training, exercise routine.
+
+20) Remix
+Definition: Audio has been transformed.
+Use ONLY for: sped up, slowed, mashup, DJ edit, remix audio, alternate audio version.
+Do NOT use for: visual transitions, edited clips, fashion transformations, fan edits.
+
+21) Carousel
+Definition: TikTok slideshow/photo carousel format.
+Use when: isSlideshow=true or the post is clearly a sequence of still photos.
+Always include Carousel if isSlideshow=true.
+Best practice: use Carousel + content label, e.g. Carousel + Beauty, Carousel + Quotes, Carousel + Celebrity Edits.
+
+=== COMMON CONFUSIONS TO AVOID ===
+- Dance vs Lip Sync: Dance = choreography/body movement. Lip Sync = mouth/face performance to lyrics.
+- Dance vs Slice of Life: if dancing is visible, do not call it Slice of Life just because setting is casual.
+- Beauty vs Fashion: Beauty = makeup/skincare/hair/nails/cosmetics. Fashion = clothes/outfit/styling.
+- Relationship vs Slice of Life: Relationship = romance/partner/love/longing. Slice of Life = ordinary daily life.
+- Quotes vs Reflection: Quotes = quote text. Reflection = personal introspection/life lesson.
+- Celebrity Edits vs Movie/Tv/Drama Edits: real public figure = Celebrity Edits. Fictional/drama/movie/anime scene = Movie/Tv/Drama Edits.
+- Media/Infotainment vs Slice of Life: if the post teaches, explains, recommends or reports, use Media/Infotainment.
+- Lyrics vs Lip Sync: Lyrics = text shown. Lip Sync = person mouths/sings lyrics.
+
+=== CONFIDENCE GUIDANCE ===
+- 0.90-1.00: clear visual/caption signal.
+- 0.75-0.89: likely correct but some ambiguity.
+- 0.50-0.74: weak signal; should probably be reviewed.
+- <0.50: cannot determine confidently.
+For motion-heavy labels like Dance, Lip Sync, Fitness and Cover, lower confidence if only static frames are available and motion is unclear.
+
+=== CONTENT DETAILS ===
+Write one concise sentence describing what happens visually, including setting, mood, objects, people and visual style.
+
+=== OUTPUT FORMAT ===
+{{"narrative": "<short theme phrase or NA>", "creative_type": ["<label1>", "<label2 optional>"], "content_details": "<one sentence>", "confidence": <float>, "reasoning": "<short reason for Creative Type>"}}"""
 
 def call_gemini(contents, gemini_key, max_retries=4):
     from google import genai
@@ -704,7 +1025,7 @@ def call_gemini(contents, gemini_key, max_retries=4):
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model='gemini-3.1-flash-lite',
+                model=GEMINI_MODEL,
                 contents=contents,
                 config=types.GenerateContentConfig(response_mime_type='application/json')
             )
@@ -724,15 +1045,108 @@ def call_gemini(contents, gemini_key, max_retries=4):
                 return {'parse_error': True, 'raw_response': err, 'needs_human_review': True}
     return {'parse_error': True, 'raw_response': 'Max retries exceeded', 'needs_human_review': True}
 
+def call_gemini_video_file(video_path, prompt, gemini_key, max_retries=3):
+    """Send the full video file to Gemini as a final AI fallback.
+
+    This is intentionally used sparingly because uploading and analysing a video
+    is slower and consumes more quota than frame-based analysis.
+    """
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=gemini_key)
+    uploaded = None
+    try:
+        uploaded = client.files.upload(file=video_path)
+
+        # Videos can need a short processing period before they are usable.
+        for _ in range(30):
+            try:
+                uploaded = client.files.get(name=uploaded.name)
+                state = getattr(uploaded, 'state', None)
+                state_name = getattr(state, 'name', str(state)).upper()
+                if 'ACTIVE' in state_name or 'SUCCEEDED' in state_name or 'READY' in state_name:
+                    break
+                if 'FAILED' in state_name:
+                    return {'parse_error': True, 'raw_response': 'Video file processing failed', 'needs_human_review': True}
+            except Exception:
+                # Some SDK versions return immediately usable file handles.
+                break
+            time.sleep(2)
+
+        video_prompt = prompt + """
+
+FULL VIDEO FALLBACK:
+You are now given the full video, not just still frames.
+Focus on temporal motion and sequence of actions.
+For Dance vs Lip Sync:
+- Dance = full-body or upper-body choreography, repeated moves, synchronized/group movement, dance challenge, dance practice/performance.
+- Lip Sync = mainly mouth/face performance to lyrics/dialogue, with little or no choreography.
+If choreography is visible across time, prioritise Dance over Lip Sync.
+Return the same JSON schema only.
+"""
+
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[video_prompt, uploaded],
+                    config=types.GenerateContentConfig(response_mime_type='application/json')
+                )
+                text = response.text.strip()
+                text = re.sub(r'^```json\s*', '', text)
+                text = re.sub(r'```$', '', text).strip()
+                return json.loads(text)
+            except Exception as e:
+                err = str(e)
+                if '429' in err or 'RESOURCE_EXHAUSTED' in err:
+                    time.sleep(90*(attempt+1) + random.randint(0,15))
+                elif '503' in err or 'UNAVAILABLE' in err:
+                    time.sleep(20*(attempt+1) + random.randint(0,10))
+                else:
+                    return {'parse_error': True, 'raw_response': err, 'needs_human_review': True}
+        return {'parse_error': True, 'raw_response': 'Max retries exceeded in video fallback', 'needs_human_review': True}
+    except Exception as e:
+        return {'parse_error': True, 'raw_response': f'Video fallback failed: {e}', 'needs_human_review': True}
+    finally:
+        # Best-effort cleanup. Not all SDK/account modes support delete.
+        try:
+            if uploaded is not None:
+                client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+def _should_try_video_fallback(row, result, status):
+    """Use full-video analysis only for likely motion ambiguity, to protect quota."""
+    try:
+        conf = float(result.get('confidence', 0) or 0)
+    except Exception:
+        conf = 0
+    labels = result.get('creative_type', []) if isinstance(result, dict) else []
+    labels = set(labels) if isinstance(labels, list) else set()
+    row_motion = _row_has_motion_cues(row)
+    result_dance_cues = _result_has_dance_visual_cues(result)
+    motion_label = bool(labels & MOTION_HEAVY_TYPES)
+    possible_dance_lipsync_confusion = ('Lip Sync' in labels and (row_motion or result_dance_cues))
+    return (
+        status == 'review'
+        or conf < 0.70
+        or possible_dance_lipsync_confusion
+        or (motion_label and conf < 0.82)
+    )
+
 def validate(result):
     issues, score = [], 0
     if result.get('parse_error'):
         return 'review', 0, ['Parse error']
     narrative = result.get('narrative', '')
-    if not narrative or narrative in ['null', 'None', '?', '']:
+    if isinstance(narrative, list):
+        narrative = ', '.join(str(x).strip() for x in narrative if str(x).strip())
+        result['narrative'] = narrative
+    narrative_clean = str(narrative).strip()
+    if not narrative_clean or narrative_clean in ['null', 'None', '?', '']:
         issues.append('Missing narrative')
-    elif len(narrative.split()) > 2:
-        issues.append(f'Narrative too long: {narrative}')
+    elif len(narrative_clean.split()) > 7:
+        issues.append(f'Narrative too long: {narrative_clean}')
     else:
         score += 1
     ct = result.get('creative_type', [])
@@ -817,7 +1231,7 @@ def build_out(row, vid_id, market, track, result, tier_used, status, score, issu
         'music_name':           (_get('musicMeta.musicName') or (raw_record.get('musicMeta', {}).get('musicName', '') if isinstance(raw_record.get('musicMeta', {}), dict) else '')),
         'music_author':         (_get('musicMeta.musicAuthor') or (raw_record.get('musicMeta', {}).get('musicAuthor', '') if isinstance(raw_record.get('musicMeta', {}), dict) else '')),
         'is_slideshow':         bool(_get('isSlideshow', raw_record.get('isSlideshow', False))),
-        'Narrative':            result.get('narrative', ''),
+        'Narrative':            (', '.join(str(x).strip() for x in result.get('narrative', []) if str(x).strip()) if isinstance(result.get('narrative', ''), list) else str(result.get('narrative', '')).strip()),
         'Creative Type':        ', '.join(result.get('creative_type', [])),
         'Content Details':      result.get('content_details', ''),
         'confidence':           final_conf,
@@ -997,27 +1411,86 @@ def run_pipeline(records, track, gemini_key, apify_token, log_list, delay_second
             contents = [prompt]
 
         result = call_gemini(contents, gemini_key)
+        result = apply_dance_guardrails(result, row)
         result['tier_used'] = 'tier1_cover'
         status, score, issues = validate(result)
 
         if status == 'review' or result.get('confidence', 0) < 0.75:
-            log_list.append("  → Tier 2 (video frames)...")
+            log_list.append("  → Tier 2A (3 video frames)...")
             video_url = get_video_url(row)
             if video_url:
                 try:
                     with tempfile.TemporaryDirectory() as tmp:
                         video_path = os.path.join(tmp, f'{vid_id}.mp4')
                         download_video(video_url, video_path, apify_token)
-                        frame_paths = extract_frames(video_path, os.path.join(tmp, 'frames'))
+
+                        # Tier 2A: fast default pass using 3 frames.
+                        frame_paths = extract_frames(video_path, os.path.join(tmp, 'frames_3'), FRAME_POINTS_3)
                         contents2 = [prompt]
                         for fp in frame_paths:
                             with open(fp, 'rb') as f:
                                 contents2.append(gtypes.Part.from_bytes(data=f.read(), mime_type='image/jpeg'))
                         result2 = call_gemini(contents2, gemini_key)
-                        result2['tier_used'] = 'tier2_frames'
+                        result2 = apply_dance_guardrails(result2, row)
+                        result2['tier_used'] = 'tier2a_3frames'
                         status2, score2, issues2 = validate(result2)
                         if score2 >= score or result.get('parse_error'):
                             result, status, score, issues = result2, status2, score2, issues2
+
+                        # Tier 2B: adaptive motion refinement.
+                        # Only run the slower 9-frame pass when the content is likely motion-heavy
+                        # or the 3-frame result is still weak. This is designed to help KR/Dance
+                        # without slowing every PH-style Lip Sync / Relationship / Quote post.
+                        should_refine_motion = (
+                            # Avoid spending 9-frame calls on every genuine PH-style Lip Sync.
+                            # Refine when there are dance/choreography cues, an initial Dance/Fitness/Cover label,
+                            # or the 3-frame result is still weak/invalid.
+                            _row_has_motion_cues(row)
+                            or _result_has_dance_visual_cues(result2)
+                            or any(x in set(result2.get('creative_type', [])) for x in ['Dance', 'Fitness', 'Cover'])
+                            or status2 == 'review'
+                            or result2.get('confidence', 0) < 0.75
+                        )
+                        if should_refine_motion:
+                            log_list.append("  → Tier 2B (adaptive 9-frame motion refinement)...")
+                            frame_paths_9 = extract_frames(video_path, os.path.join(tmp, 'frames_9'), FRAME_POINTS_9)
+                            contents9 = [prompt + "\n\nMotion-aware refinement: analyse the sequence of frames carefully. If full-body choreography or repeated body movement is visible across frames, prioritise Dance over Lip Sync or Relationship. Use Lip Sync only when mouth/face performance is the main action and there is little/no choreography."]
+                            for fp in frame_paths_9:
+                                with open(fp, 'rb') as f:
+                                    contents9.append(gtypes.Part.from_bytes(data=f.read(), mime_type='image/jpeg'))
+                            result9 = call_gemini(contents9, gemini_key)
+                            result9 = apply_dance_guardrails(result9, row)
+                            result9['tier_used'] = 'tier2b_9frames_adaptive'
+                            status9, score9, issues9 = validate(result9)
+                            # Prefer 9-frame result only when it is clearly stronger or fixes a failed/low-confidence result.
+                            if (
+                                score9 > score
+                                or result.get('parse_error')
+                                or (status != 'pass' and status9 == 'pass')
+                                or (result9.get('confidence', 0) >= result.get('confidence', 0) + 0.10)
+                            ):
+                                result, status, score, issues = result9, status9, score9, issues9
+
+                        # Tier 2C: full-video fallback, used only for unresolved motion-heavy ambiguity.
+                        # This is slower and consumes more quota, so it is deliberately conservative.
+                        if _should_try_video_fallback(row, result, status):
+                            log_list.append("  → Tier 2C (full video fallback, motion ambiguity only)...")
+                            video_prompt = prompt + "\n\nUse the full video to resolve motion ambiguity. If choreography is visible over time, choose Dance over Lip Sync."
+                            resultv = call_gemini_video_file(video_path, video_prompt, gemini_key)
+                            resultv = apply_dance_guardrails(resultv, row)
+                            resultv['tier_used'] = 'tier2c_full_video'
+                            statusv, scorev, issuesv = validate(resultv)
+                            # Prefer full-video result when it passes validation and is at least as strong,
+                            # or when it fixes a low-confidence/review result.
+                            if (
+                                not resultv.get('parse_error')
+                                and (
+                                    scorev > score
+                                    or (status != 'pass' and statusv == 'pass')
+                                    or (resultv.get('confidence', 0) >= max(0.75, result.get('confidence', 0) + 0.05))
+                                )
+                            ):
+                                result, status, score, issues = resultv, statusv, scorev, issuesv
                 except Exception as e:
                     log_list.append(f"  → Tier 2 failed: {e}")
 
@@ -1820,7 +2293,7 @@ elif page == "Upload & Tag":
                 <div><div class='big'>{video_ready}/{len(run_configs)}</div><div class='label'>Video Links</div></div>
                 <div><div class='big'>~{est_min}m</div><div class='label'>Est. Time</div></div>
             </div>
-            <div class='small-muted'>Tier 0V: visual-only for vague captions · Tier 1: cover image · Tier 2: video frames on low confidence</div>
+            <div class='small-muted'>Tier 0V: visual-only for vague captions · Tier 1: cover image · Tier 2A: 3 frames · Tier 2B: adaptive 9-frame refinement</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -2335,6 +2808,7 @@ elif page == "Review Flagged":
                         except Exception:
                             pass
                     suggest_result = call_gemini(contents_suggest, gemini_key_r)
+                    suggest_result = apply_dance_guardrails(suggest_result, source_row)
                     st.session_state[ai_result_key] = suggest_result
 
         # Pre-fill defaults from AI suggestion if available
@@ -2440,7 +2914,7 @@ elif page == "Review Flagged":
 
         if st.button("Save & Next", type="primary", use_container_width=True):
             if narrative_choice == 'Custom' and not custom_narrative_value:
-                st.error("Please type a custom narrative, or choose Other if you do not want to type one.")
+                st.error("Please type a custom narrative, or choose Other/NA if you do not want to type one.")
             elif market_unknown and not final_market:
                 st.error("Please select or type the market before saving.")
             elif not narrative or not creative_type or not content_details:
@@ -2527,6 +3001,16 @@ elif page == "Summary":
     """, unsafe_allow_html=True)
 
     INDIGO_PALETTE = ['#4f46e5','#818cf8','#6366f1','#a5b4fc','#3730a3','#c7d2fe','#312e81','#e0e7ff']
+    MARKET_COLORS = {
+        'MY': '#2563EB',
+        'PH': '#F59E0B',
+        'SG': '#10B981',
+        'TH': '#EF4444',
+        'VN': '#8B5CF6',
+        'KR': '#EC4899',
+        'ID': '#14B8A6',
+        'UNKNOWN': '#64748B',
+    }
 
     # ── Market / Country Overview ──────────────────────────
     st.markdown("<div class='section-card'><h3>Market / Country Overview</h3>", unsafe_allow_html=True)
@@ -2594,49 +3078,158 @@ elif page == "Summary":
         st.caption("No market data available yet.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 1: Narrative by Market + Creative Type by Market ──────────
+    # ── Executive Insights ─────────────────────────────────
+    def _fmt_pct(x):
+        try:
+            if pd.isna(x) or x == float('inf'):
+                return '—'
+            return f'{x:.1%}'
+        except Exception:
+            return '—'
+
+    def _safe_num_col(frame, col):
+        if col in frame.columns:
+            return pd.to_numeric(frame[col], errors='coerce').fillna(0)
+        return pd.Series([0] * len(frame), index=frame.index)
+
+    dff['_plays_num'] = _safe_num_col(dff, 'plays')
+    dff['_likes_num'] = _safe_num_col(dff, 'likes')
+    dff['_shares_num'] = _safe_num_col(dff, 'shares')
+    dff['_comments_num'] = _safe_num_col(dff, 'comments')
+    dff['_saves_num'] = _safe_num_col(dff, 'saves')
+    dff['_engagement_num'] = dff['_likes_num'] + dff['_shares_num'] + dff['_comments_num'] + dff['_saves_num']
+
+    st.markdown("<div class='section-card'><h3>Executive Snapshot</h3>", unsafe_allow_html=True)
+    insight_items = []
+
+    if 'Creative Type' in dff.columns and not dff.empty:
+        ct_tmp = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy()
+        if not ct_tmp.empty:
+            ct_tmp = ct_tmp.assign(**{'Creative Type': ct_tmp['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            ct_counts = ct_tmp['Creative Type'].value_counts()
+            if not ct_counts.empty:
+                top_ct = ct_counts.index[0]
+                top_ct_share = ct_counts.iloc[0] / max(len(ct_tmp), 1)
+                insight_items.append(f"<strong>{top_ct}</strong> is the leading creative type ({top_ct_share:.0%} of tagged labels).")
+
+    if 'Narrative' in dff.columns and not dff.empty:
+        narr_counts = dff['Narrative'].dropna().astype(str).str.strip()
+        narr_counts = narr_counts[narr_counts != ''].value_counts()
+        if not narr_counts.empty:
+            insight_items.append(f"Top narrative: <strong>{narr_counts.index[0]}</strong> ({int(narr_counts.iloc[0])} post(s)).")
+
+    if 'market' in dff.columns and not dff.empty:
+        market_counts = dff['market'].dropna().astype(str).value_counts()
+        if not market_counts.empty:
+            insight_items.append(f"Largest market sample: <strong>{market_counts.index[0]}</strong> ({int(market_counts.iloc[0])} post(s)).")
+
+    if dff['_plays_num'].sum() > 0 and 'Creative Type' in dff.columns:
+        perf_tmp = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy()
+        if not perf_tmp.empty:
+            perf_tmp = perf_tmp.assign(**{'Creative Type': perf_tmp['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            perf_grp = perf_tmp.groupby('Creative Type').agg(Posts=('id', 'count'), Avg_Plays=('_plays_num', 'mean')).reset_index()
+            perf_grp = perf_grp[perf_grp['Posts'] >= 2].sort_values('Avg_Plays', ascending=False)
+            if not perf_grp.empty:
+                insight_items.append(f"Best average plays by format: <strong>{perf_grp.iloc[0]['Creative Type']}</strong> ({int(perf_grp.iloc[0]['Avg_Plays']):,} avg plays).")
+
+    if not insight_items:
+        insight_items.append("Add tagged rows to generate trend highlights automatically.")
+
+    st.markdown(
+        "<div class='info-banner'><ul style='margin:0;padding-left:18px;line-height:1.8'>" +
+        ''.join(f"<li>{x}</li>" for x in insight_items[:5]) +
+        "</ul></div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Row 1: clearer, limited charts ─────────────────────
     c1, c2 = st.columns(2, gap="large")
 
     with c1:
-        st.markdown("<div class='section-card'><h3>Narrative by Market</h3>", unsafe_allow_html=True)
-        narr = dff[dff['Narrative'].notna() & (dff['Narrative'] != '')]\
-            .groupby(['Narrative', 'market']).size().reset_index(name='Count')
-        if not narr.empty:
-            # order narratives by total count
-            order = narr.groupby('Narrative')['Count'].sum().sort_values().index.tolist()
-            fig = px.bar(narr, x='Count', y='Narrative', color='market', orientation='h',
-                         barmode='stack', template='plotly_white',
-                         color_discrete_sequence=INDIGO_PALETTE,
-                         category_orders={'Narrative': order},
-                         labels={'Count': 'Posts', 'market': 'Market'})
-            fig.update_layout(margin=dict(l=0, r=0, t=4, b=0),
-                              height=320, yaxis_title='', xaxis_title='Posts',
-                              plot_bgcolor='white', paper_bgcolor='white',
-                              font=dict(color='#334155', size=12),
-                              yaxis=dict(tickfont=dict(color='#334155')),
-                              xaxis=dict(tickfont=dict(color='#334155')),
-                              legend=dict(orientation='h', y=1.08, font=dict(color='#334155'), title=''))
-            fig.update_traces(marker_line_width=0)
-            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("<div class='section-card'><h3>Engagement by Market</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Total likes, comments, shares and saves by market.</p>", unsafe_allow_html=True)
+        if not dff.empty and 'market' in dff.columns:
+            eng_market = dff.groupby('market').agg(
+                Likes=('_likes_num', 'sum'),
+                Comments=('_comments_num', 'sum'),
+                Shares=('_shares_num', 'sum'),
+                Saves=('_saves_num', 'sum'),
+                Total_Engagement=('_engagement_num', 'sum'),
+                Posts=('id', 'count')
+            ).reset_index()
+            eng_market = eng_market[eng_market['Total_Engagement'] > 0].copy()
+            if not eng_market.empty:
+                eng_long = eng_market.melt(
+                    id_vars=['market', 'Posts', 'Total_Engagement'],
+                    value_vars=['Likes', 'Comments', 'Shares', 'Saves'],
+                    var_name='Engagement Type',
+                    value_name='Count'
+                )
+                eng_long = eng_long[eng_long['Count'] > 0]
+                order_eng = eng_market.sort_values('Total_Engagement', ascending=True)['market'].tolist()
+                ENGAGEMENT_COLORS = {
+                    'Likes': '#2563EB',
+                    'Comments': '#10B981',
+                    'Shares': '#F59E0B',
+                    'Saves': '#8B5CF6',
+                }
+                fig_eng = px.bar(
+                    eng_long,
+                    x='Count',
+                    y='market',
+                    color='Engagement Type',
+                    orientation='h',
+                    barmode='stack',
+                    template='plotly_white',
+                    color_discrete_map=ENGAGEMENT_COLORS,
+                    category_orders={'market': order_eng},
+                    labels={'Count': 'Total Engagement', 'market': 'Market'}
+                )
+                fig_eng.update_layout(
+                    margin=dict(l=0, r=0, t=4, b=0),
+                    height=max(300, len(order_eng) * 58),
+                    yaxis_title='',
+                    xaxis_title='Total Engagement',
+                    plot_bgcolor='white',
+                    paper_bgcolor='white',
+                    font=dict(color='#334155', size=12),
+                    yaxis=dict(tickfont=dict(color='#334155')),
+                    xaxis=dict(tickfont=dict(color='#334155')),
+                    legend=dict(orientation='h', y=1.08, font=dict(color='#334155'), title='')
+                )
+                fig_eng.update_traces(marker_line_width=0)
+                st.plotly_chart(fig_eng, use_container_width=True)
+
+                eng_table = eng_market.copy().sort_values('Total_Engagement', ascending=False)
+                for col in ['Likes', 'Comments', 'Shares', 'Saves', 'Total_Engagement']:
+                    eng_table[col] = eng_table[col].apply(lambda x: f'{int(x):,}')
+                eng_table = eng_table.rename(columns={'market': 'Market', 'Total_Engagement': 'Total Engagement'})
+                st.dataframe(eng_table[['Market', 'Posts', 'Likes', 'Comments', 'Shares', 'Saves', 'Total Engagement']], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No engagement data yet.")
         else:
-            st.caption("No data yet.")
+            st.caption("No market / engagement data yet.")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
-        st.markdown("<div class='section-card'><h3>Creative Type by Market</h3>", unsafe_allow_html=True)
-        ct_exp = dff[dff['Creative Type'].notna() & (dff['Creative Type'] != '')].copy()
-        ct_exp = ct_exp.assign(**{'Creative Type': ct_exp['Creative Type'].str.split(', ')})\
-            .explode('Creative Type')
-        ct_grp = ct_exp.groupby(['Creative Type', 'market']).size().reset_index(name='Count')
-        if not ct_grp.empty:
-            order2 = ct_grp.groupby('Creative Type')['Count'].sum().sort_values().index.tolist()
-            fig2 = px.bar(ct_grp, x='Count', y='Creative Type', color='market', orientation='h',
+        st.markdown("<div class='section-card'><h3>Creative Type Mix</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Sorted by total posts, so dominant content formats are obvious.</p>", unsafe_allow_html=True)
+        ct_exp = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy() if 'Creative Type' in dff.columns else pd.DataFrame()
+        if not ct_exp.empty:
+            ct_exp = ct_exp.assign(**{'Creative Type': ct_exp['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            ct_grp = ct_exp.groupby(['Creative Type', 'market']).size().reset_index(name='Posts')
+            total_ct = ct_grp.groupby('Creative Type')['Posts'].sum().sort_values(ascending=True)
+            keep_ct = total_ct.tail(12).index.tolist()
+            ct_grp = ct_grp[ct_grp['Creative Type'].isin(keep_ct)]
+            order2 = ct_grp.groupby('Creative Type')['Posts'].sum().sort_values().index.tolist()
+            fig2 = px.bar(ct_grp, x='Posts', y='Creative Type', color='market', orientation='h',
                           barmode='stack', template='plotly_white',
-                          color_discrete_sequence=INDIGO_PALETTE,
+                          color_discrete_map=MARKET_COLORS,
                           category_orders={'Creative Type': order2},
-                          labels={'Count': 'Posts', 'market': 'Market'})
+                          labels={'Posts': 'Posts', 'market': 'Market'})
             fig2.update_layout(margin=dict(l=0, r=0, t=4, b=0),
-                               height=320, yaxis_title='', xaxis_title='Posts',
+                               height=max(300, len(order2) * 32), yaxis_title='', xaxis_title='Posts',
                                plot_bgcolor='white', paper_bgcolor='white',
                                font=dict(color='#334155', size=12),
                                yaxis=dict(tickfont=dict(color='#334155')),
@@ -2645,28 +3238,83 @@ elif page == "Summary":
             fig2.update_traces(marker_line_width=0)
             st.plotly_chart(fig2, use_container_width=True)
         else:
-            st.caption("No data yet.")
+            st.caption("No creative type data yet.")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 2: Track Leaderboard (full width) ─────────────
+    # ── Row 2: performance, not just counts ───────────────
+    c3, c4 = st.columns(2, gap="large")
+
+    with c3:
+        st.markdown("<div class='section-card'><h3>Engagement Rate by Creative Type</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Shows which formats perform better, not only which formats appear more often.</p>", unsafe_allow_html=True)
+        er_src = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy() if 'Creative Type' in dff.columns else pd.DataFrame()
+        if not er_src.empty and er_src['_plays_num'].sum() > 0:
+            er_src = er_src.assign(**{'Creative Type': er_src['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            er_grp = er_src.groupby('Creative Type').agg(
+                Posts=('id', 'count'),
+                Plays=('_plays_num', 'sum'),
+                Engagement=('_engagement_num', 'sum')
+            ).reset_index()
+            er_grp = er_grp[(er_grp['Posts'] >= 2) & (er_grp['Plays'] > 0)].copy()
+            er_grp['Engagement Rate'] = er_grp['Engagement'] / er_grp['Plays']
+            er_grp = er_grp.sort_values('Engagement Rate', ascending=True).tail(10)
+            if not er_grp.empty:
+                fig_er = px.bar(er_grp, x='Engagement Rate', y='Creative Type', orientation='h',
+                                template='plotly_white', text=er_grp['Engagement Rate'].apply(lambda x: f'{x:.1%}'),
+                                hover_data={'Posts': True, 'Plays': ':,', 'Engagement': ':,', 'Engagement Rate': ':.1%'})
+                fig_er.update_layout(margin=dict(l=0, r=0, t=4, b=0),
+                                     height=max(300, len(er_grp) * 34), yaxis_title='', xaxis_title='Engagement Rate',
+                                     plot_bgcolor='white', paper_bgcolor='white',
+                                     font=dict(color='#334155', size=12),
+                                     yaxis=dict(tickfont=dict(color='#334155')),
+                                     xaxis=dict(tickfont=dict(color='#334155'), tickformat='.0%'))
+                fig_er.update_traces(marker_line_width=0, textposition='outside')
+                st.plotly_chart(fig_er, use_container_width=True)
+            else:
+                st.caption("Need at least 2 posts per creative type to show this chart.")
+        else:
+            st.caption("No plays / engagement data yet.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with c4:
+        st.markdown("<div class='section-card'><h3>Market Content Mix</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Top creative type per market with share of posts.</p>", unsafe_allow_html=True)
+        mix_src = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy() if 'Creative Type' in dff.columns else pd.DataFrame()
+        if not mix_src.empty and 'market' in mix_src.columns:
+            mix_src = mix_src.assign(**{'Creative Type': mix_src['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            mix = mix_src.groupby(['market', 'Creative Type']).size().reset_index(name='Posts')
+            totals = mix.groupby('market')['Posts'].transform('sum')
+            mix['Share'] = mix['Posts'] / totals
+            top_mix = mix.sort_values(['market', 'Posts'], ascending=[True, False]).groupby('market').head(3).copy()
+            top_mix['Share'] = top_mix['Share'].apply(lambda x: f'{x:.0%}')
+            top_mix = top_mix.rename(columns={'market': 'Market'})
+            st.dataframe(top_mix[['Market', 'Creative Type', 'Posts', 'Share']], use_container_width=True, hide_index=True)
+        else:
+            st.caption("No market / creative type data yet.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Row 3: Track Leaderboard (full width) ─────────────
     st.markdown("<div class='section-card'><h3>Track Leaderboard by Plays</h3>", unsafe_allow_html=True)
-    if 'plays' in dff.columns and dff['plays'].sum() > 0:
+    if 'plays' in dff.columns and dff['_plays_num'].sum() > 0:
         leaderboard = dff.groupby(['market', 'track']).agg(
-            Total_Plays=('plays', 'sum'),
-            Posts=('id', 'count')
+            Total_Plays=('_plays_num', 'sum'),
+            Posts=('id', 'count'),
+            Avg_Plays=('_plays_num', 'mean'),
+            Total_Engagement=('_engagement_num', 'sum')
         ).reset_index()
-        leaderboard['Avg_Plays'] = (leaderboard['Total_Plays'] / leaderboard['Posts']).round(0)
-        leaderboard['label'] = leaderboard['track'].str[:35]
-        leaderboard = leaderboard.sort_values('Total_Plays', ascending=True)
+        leaderboard['Avg_Plays'] = leaderboard['Avg_Plays'].round(0)
+        leaderboard['Engagement Rate'] = leaderboard['Total_Engagement'] / leaderboard['Total_Plays'].replace(0, pd.NA)
+        leaderboard['label'] = leaderboard['track'].astype(str).str[:45]
+        leaderboard = leaderboard.sort_values('Total_Plays', ascending=True).tail(20)
         fig_lb = px.bar(
             leaderboard, x='Total_Plays', y='label', orientation='h',
             color='market', template='plotly_white',
-            color_discrete_sequence=INDIGO_PALETTE,
-            hover_data={'market': True, 'Posts': True, 'Avg_Plays': True, 'Total_Plays': True, 'label': False},
+            color_discrete_map=MARKET_COLORS,
+            hover_data={'market': True, 'Posts': True, 'Avg_Plays': ':,.0f', 'Total_Plays': ':,.0f', 'Engagement Rate': ':.1%', 'label': False},
             labels={'label': '', 'Total_Plays': 'Total Plays', 'market': 'Market'}
         )
         fig_lb.update_layout(
-            margin=dict(l=0, r=0, t=4, b=0), height=max(280, len(leaderboard) * 36),
+            margin=dict(l=0, r=0, t=4, b=0), height=max(360, len(leaderboard) * 34),
             xaxis_title='Total Plays', yaxis_title='',
             plot_bgcolor='white', paper_bgcolor='white',
             font=dict(color='#334155', size=12),
@@ -2680,9 +3328,9 @@ elif page == "Summary":
         st.caption("No plays data yet.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 3: Market & Track ranked table ───────────────────────────────
-    has_plays = 'plays' in dff.columns and dff['plays'].sum() > 0
-    has_likes = 'likes' in dff.columns and dff['likes'].sum() > 0
+    # ── Row 4: Market & Track ranked table ───────────────────────────────
+    has_plays = '_plays_num' in dff.columns and dff['_plays_num'].sum() > 0
+    has_likes = '_likes_num' in dff.columns and dff['_likes_num'].sum() > 0
 
     st.markdown("<div class='section-card'><h3>Track Performance by Market</h3>", unsafe_allow_html=True)
     mkt_agg = dict(
@@ -2692,18 +3340,18 @@ elif page == "Summary":
         Avg_Confidence=('confidence', 'mean'),
     )
     if has_plays:
-        mkt_agg['Total_Plays'] = ('plays', 'sum')
+        mkt_agg['Total_Plays'] = ('_plays_num', 'sum')
+        mkt_agg['Total_Engagement'] = ('_engagement_num', 'sum')
     if has_likes:
-        mkt_agg['Total_Likes'] = ('likes', 'sum')
+        mkt_agg['Total_Likes'] = ('_likes_num', 'sum')
 
     mkt = dff.groupby(['market', 'track']).agg(**mkt_agg).reset_index()
 
     if has_plays:
         mkt['Avg_Plays'] = (mkt['Total_Plays'] / mkt['Posts']).round(0).astype(int)
+        mkt['Engagement Rate'] = (mkt['Total_Engagement'] / mkt['Total_Plays']).apply(_fmt_pct)
     if has_plays and has_likes:
-        mkt['Like_Rate'] = (mkt['Total_Likes'] / mkt['Total_Plays']).apply(
-            lambda x: f'{x:.1%}' if x == x else '—'
-        )
+        mkt['Like_Rate'] = (mkt['Total_Likes'] / mkt['Total_Plays']).apply(_fmt_pct)
 
     rank_col = 'Total_Plays' if has_plays else 'Posts'
     mkt['Rank'] = mkt.groupby('market')[rank_col].rank(ascending=False, method='min').astype(int)
@@ -2712,22 +3360,22 @@ elif page == "Summary":
     mkt['Avg_Confidence'] = mkt['Avg_Confidence'].apply(lambda x: f'{x:.0%}' if x == x else '—')
 
     display_cols = ['Rank', 'market', 'track', 'Posts', 'Total_Plays', 'Avg_Plays',
-                    'Total_Likes', 'Like_Rate', 'Automation', 'Avg_Confidence', 'Flagged']
+                    'Total_Likes', 'Like_Rate', 'Engagement Rate', 'Automation', 'Avg_Confidence', 'Flagged']
     display_cols = [c for c in display_cols if c in mkt.columns]
     st.dataframe(mkt[display_cols], use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 4: What's Working — top narrative per track ───────────────────
+    # ── Row 5: What's Working — top narrative per track ───────────────────
     if 'Narrative' in dff.columns and has_plays:
-        narr_track = dff[dff['Narrative'].notna() & (dff['Narrative'] != '')].copy()
+        narr_track = dff[dff['Narrative'].notna() & (dff['Narrative'].astype(str).str.strip() != '')].copy()
         if not narr_track.empty:
             st.markdown("<div class='section-card'><h3>What's Working — Top Narrative per Track</h3>", unsafe_allow_html=True)
             st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>For each market + track, the narrative that drives the highest average plays.</p>", unsafe_allow_html=True)
 
             narr_grp = narr_track.groupby(['market', 'track', 'Narrative']).agg(
                 Posts=('id', 'count'),
-                Avg_Plays=('plays', 'mean'),
-                Total_Plays=('plays', 'sum'),
+                Avg_Plays=('_plays_num', 'mean'),
+                Total_Plays=('_plays_num', 'sum'),
             ).reset_index()
             narr_grp['Avg_Plays'] = narr_grp['Avg_Plays'].round(0).astype(int)
 
