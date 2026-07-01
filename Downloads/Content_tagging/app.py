@@ -3001,6 +3001,16 @@ elif page == "Summary":
     """, unsafe_allow_html=True)
 
     INDIGO_PALETTE = ['#4f46e5','#818cf8','#6366f1','#a5b4fc','#3730a3','#c7d2fe','#312e81','#e0e7ff']
+    MARKET_COLORS = {
+        'MY': '#2563EB',
+        'PH': '#F59E0B',
+        'SG': '#10B981',
+        'TH': '#EF4444',
+        'VN': '#8B5CF6',
+        'KR': '#EC4899',
+        'ID': '#14B8A6',
+        'UNKNOWN': '#64748B',
+    }
 
     # ── Market / Country Overview ──────────────────────────
     st.markdown("<div class='section-card'><h3>Market / Country Overview</h3>", unsafe_allow_html=True)
@@ -3068,49 +3078,158 @@ elif page == "Summary":
         st.caption("No market data available yet.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 1: Narrative by Market + Creative Type by Market ──────────
+    # ── Executive Insights ─────────────────────────────────
+    def _fmt_pct(x):
+        try:
+            if pd.isna(x) or x == float('inf'):
+                return '—'
+            return f'{x:.1%}'
+        except Exception:
+            return '—'
+
+    def _safe_num_col(frame, col):
+        if col in frame.columns:
+            return pd.to_numeric(frame[col], errors='coerce').fillna(0)
+        return pd.Series([0] * len(frame), index=frame.index)
+
+    dff['_plays_num'] = _safe_num_col(dff, 'plays')
+    dff['_likes_num'] = _safe_num_col(dff, 'likes')
+    dff['_shares_num'] = _safe_num_col(dff, 'shares')
+    dff['_comments_num'] = _safe_num_col(dff, 'comments')
+    dff['_saves_num'] = _safe_num_col(dff, 'saves')
+    dff['_engagement_num'] = dff['_likes_num'] + dff['_shares_num'] + dff['_comments_num'] + dff['_saves_num']
+
+    st.markdown("<div class='section-card'><h3>Executive Snapshot</h3>", unsafe_allow_html=True)
+    insight_items = []
+
+    if 'Creative Type' in dff.columns and not dff.empty:
+        ct_tmp = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy()
+        if not ct_tmp.empty:
+            ct_tmp = ct_tmp.assign(**{'Creative Type': ct_tmp['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            ct_counts = ct_tmp['Creative Type'].value_counts()
+            if not ct_counts.empty:
+                top_ct = ct_counts.index[0]
+                top_ct_share = ct_counts.iloc[0] / max(len(ct_tmp), 1)
+                insight_items.append(f"<strong>{top_ct}</strong> is the leading creative type ({top_ct_share:.0%} of tagged labels).")
+
+    if 'Narrative' in dff.columns and not dff.empty:
+        narr_counts = dff['Narrative'].dropna().astype(str).str.strip()
+        narr_counts = narr_counts[narr_counts != ''].value_counts()
+        if not narr_counts.empty:
+            insight_items.append(f"Top narrative: <strong>{narr_counts.index[0]}</strong> ({int(narr_counts.iloc[0])} post(s)).")
+
+    if 'market' in dff.columns and not dff.empty:
+        market_counts = dff['market'].dropna().astype(str).value_counts()
+        if not market_counts.empty:
+            insight_items.append(f"Largest market sample: <strong>{market_counts.index[0]}</strong> ({int(market_counts.iloc[0])} post(s)).")
+
+    if dff['_plays_num'].sum() > 0 and 'Creative Type' in dff.columns:
+        perf_tmp = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy()
+        if not perf_tmp.empty:
+            perf_tmp = perf_tmp.assign(**{'Creative Type': perf_tmp['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            perf_grp = perf_tmp.groupby('Creative Type').agg(Posts=('id', 'count'), Avg_Plays=('_plays_num', 'mean')).reset_index()
+            perf_grp = perf_grp[perf_grp['Posts'] >= 2].sort_values('Avg_Plays', ascending=False)
+            if not perf_grp.empty:
+                insight_items.append(f"Best average plays by format: <strong>{perf_grp.iloc[0]['Creative Type']}</strong> ({int(perf_grp.iloc[0]['Avg_Plays']):,} avg plays).")
+
+    if not insight_items:
+        insight_items.append("Add tagged rows to generate trend highlights automatically.")
+
+    st.markdown(
+        "<div class='info-banner'><ul style='margin:0;padding-left:18px;line-height:1.8'>" +
+        ''.join(f"<li>{x}</li>" for x in insight_items[:5]) +
+        "</ul></div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Row 1: clearer, limited charts ─────────────────────
     c1, c2 = st.columns(2, gap="large")
 
     with c1:
-        st.markdown("<div class='section-card'><h3>Narrative by Market</h3>", unsafe_allow_html=True)
-        narr = dff[dff['Narrative'].notna() & (dff['Narrative'] != '')]\
-            .groupby(['Narrative', 'market']).size().reset_index(name='Count')
-        if not narr.empty:
-            # order narratives by total count
-            order = narr.groupby('Narrative')['Count'].sum().sort_values().index.tolist()
-            fig = px.bar(narr, x='Count', y='Narrative', color='market', orientation='h',
-                         barmode='stack', template='plotly_white',
-                         color_discrete_sequence=INDIGO_PALETTE,
-                         category_orders={'Narrative': order},
-                         labels={'Count': 'Posts', 'market': 'Market'})
-            fig.update_layout(margin=dict(l=0, r=0, t=4, b=0),
-                              height=320, yaxis_title='', xaxis_title='Posts',
-                              plot_bgcolor='white', paper_bgcolor='white',
-                              font=dict(color='#334155', size=12),
-                              yaxis=dict(tickfont=dict(color='#334155')),
-                              xaxis=dict(tickfont=dict(color='#334155')),
-                              legend=dict(orientation='h', y=1.08, font=dict(color='#334155'), title=''))
-            fig.update_traces(marker_line_width=0)
-            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("<div class='section-card'><h3>Engagement by Market</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Total likes, comments, shares and saves by market.</p>", unsafe_allow_html=True)
+        if not dff.empty and 'market' in dff.columns:
+            eng_market = dff.groupby('market').agg(
+                Likes=('_likes_num', 'sum'),
+                Comments=('_comments_num', 'sum'),
+                Shares=('_shares_num', 'sum'),
+                Saves=('_saves_num', 'sum'),
+                Total_Engagement=('_engagement_num', 'sum'),
+                Posts=('id', 'count')
+            ).reset_index()
+            eng_market = eng_market[eng_market['Total_Engagement'] > 0].copy()
+            if not eng_market.empty:
+                eng_long = eng_market.melt(
+                    id_vars=['market', 'Posts', 'Total_Engagement'],
+                    value_vars=['Likes', 'Comments', 'Shares', 'Saves'],
+                    var_name='Engagement Type',
+                    value_name='Count'
+                )
+                eng_long = eng_long[eng_long['Count'] > 0]
+                order_eng = eng_market.sort_values('Total_Engagement', ascending=True)['market'].tolist()
+                ENGAGEMENT_COLORS = {
+                    'Likes': '#2563EB',
+                    'Comments': '#10B981',
+                    'Shares': '#F59E0B',
+                    'Saves': '#8B5CF6',
+                }
+                fig_eng = px.bar(
+                    eng_long,
+                    x='Count',
+                    y='market',
+                    color='Engagement Type',
+                    orientation='h',
+                    barmode='stack',
+                    template='plotly_white',
+                    color_discrete_map=ENGAGEMENT_COLORS,
+                    category_orders={'market': order_eng},
+                    labels={'Count': 'Total Engagement', 'market': 'Market'}
+                )
+                fig_eng.update_layout(
+                    margin=dict(l=0, r=0, t=4, b=0),
+                    height=max(300, len(order_eng) * 58),
+                    yaxis_title='',
+                    xaxis_title='Total Engagement',
+                    plot_bgcolor='white',
+                    paper_bgcolor='white',
+                    font=dict(color='#334155', size=12),
+                    yaxis=dict(tickfont=dict(color='#334155')),
+                    xaxis=dict(tickfont=dict(color='#334155')),
+                    legend=dict(orientation='h', y=1.08, font=dict(color='#334155'), title='')
+                )
+                fig_eng.update_traces(marker_line_width=0)
+                st.plotly_chart(fig_eng, use_container_width=True)
+
+                eng_table = eng_market.copy().sort_values('Total_Engagement', ascending=False)
+                for col in ['Likes', 'Comments', 'Shares', 'Saves', 'Total_Engagement']:
+                    eng_table[col] = eng_table[col].apply(lambda x: f'{int(x):,}')
+                eng_table = eng_table.rename(columns={'market': 'Market', 'Total_Engagement': 'Total Engagement'})
+                st.dataframe(eng_table[['Market', 'Posts', 'Likes', 'Comments', 'Shares', 'Saves', 'Total Engagement']], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No engagement data yet.")
         else:
-            st.caption("No data yet.")
+            st.caption("No market / engagement data yet.")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
-        st.markdown("<div class='section-card'><h3>Creative Type by Market</h3>", unsafe_allow_html=True)
-        ct_exp = dff[dff['Creative Type'].notna() & (dff['Creative Type'] != '')].copy()
-        ct_exp = ct_exp.assign(**{'Creative Type': ct_exp['Creative Type'].str.split(', ')})\
-            .explode('Creative Type')
-        ct_grp = ct_exp.groupby(['Creative Type', 'market']).size().reset_index(name='Count')
-        if not ct_grp.empty:
-            order2 = ct_grp.groupby('Creative Type')['Count'].sum().sort_values().index.tolist()
-            fig2 = px.bar(ct_grp, x='Count', y='Creative Type', color='market', orientation='h',
+        st.markdown("<div class='section-card'><h3>Creative Type Mix</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Sorted by total posts, so dominant content formats are obvious.</p>", unsafe_allow_html=True)
+        ct_exp = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy() if 'Creative Type' in dff.columns else pd.DataFrame()
+        if not ct_exp.empty:
+            ct_exp = ct_exp.assign(**{'Creative Type': ct_exp['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            ct_grp = ct_exp.groupby(['Creative Type', 'market']).size().reset_index(name='Posts')
+            total_ct = ct_grp.groupby('Creative Type')['Posts'].sum().sort_values(ascending=True)
+            keep_ct = total_ct.tail(12).index.tolist()
+            ct_grp = ct_grp[ct_grp['Creative Type'].isin(keep_ct)]
+            order2 = ct_grp.groupby('Creative Type')['Posts'].sum().sort_values().index.tolist()
+            fig2 = px.bar(ct_grp, x='Posts', y='Creative Type', color='market', orientation='h',
                           barmode='stack', template='plotly_white',
-                          color_discrete_sequence=INDIGO_PALETTE,
+                          color_discrete_map=MARKET_COLORS,
                           category_orders={'Creative Type': order2},
-                          labels={'Count': 'Posts', 'market': 'Market'})
+                          labels={'Posts': 'Posts', 'market': 'Market'})
             fig2.update_layout(margin=dict(l=0, r=0, t=4, b=0),
-                               height=320, yaxis_title='', xaxis_title='Posts',
+                               height=max(300, len(order2) * 32), yaxis_title='', xaxis_title='Posts',
                                plot_bgcolor='white', paper_bgcolor='white',
                                font=dict(color='#334155', size=12),
                                yaxis=dict(tickfont=dict(color='#334155')),
@@ -3119,28 +3238,83 @@ elif page == "Summary":
             fig2.update_traces(marker_line_width=0)
             st.plotly_chart(fig2, use_container_width=True)
         else:
-            st.caption("No data yet.")
+            st.caption("No creative type data yet.")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 2: Track Leaderboard (full width) ─────────────
+    # ── Row 2: performance, not just counts ───────────────
+    c3, c4 = st.columns(2, gap="large")
+
+    with c3:
+        st.markdown("<div class='section-card'><h3>Engagement Rate by Creative Type</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Shows which formats perform better, not only which formats appear more often.</p>", unsafe_allow_html=True)
+        er_src = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy() if 'Creative Type' in dff.columns else pd.DataFrame()
+        if not er_src.empty and er_src['_plays_num'].sum() > 0:
+            er_src = er_src.assign(**{'Creative Type': er_src['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            er_grp = er_src.groupby('Creative Type').agg(
+                Posts=('id', 'count'),
+                Plays=('_plays_num', 'sum'),
+                Engagement=('_engagement_num', 'sum')
+            ).reset_index()
+            er_grp = er_grp[(er_grp['Posts'] >= 2) & (er_grp['Plays'] > 0)].copy()
+            er_grp['Engagement Rate'] = er_grp['Engagement'] / er_grp['Plays']
+            er_grp = er_grp.sort_values('Engagement Rate', ascending=True).tail(10)
+            if not er_grp.empty:
+                fig_er = px.bar(er_grp, x='Engagement Rate', y='Creative Type', orientation='h',
+                                template='plotly_white', text=er_grp['Engagement Rate'].apply(lambda x: f'{x:.1%}'),
+                                hover_data={'Posts': True, 'Plays': ':,', 'Engagement': ':,', 'Engagement Rate': ':.1%'})
+                fig_er.update_layout(margin=dict(l=0, r=0, t=4, b=0),
+                                     height=max(300, len(er_grp) * 34), yaxis_title='', xaxis_title='Engagement Rate',
+                                     plot_bgcolor='white', paper_bgcolor='white',
+                                     font=dict(color='#334155', size=12),
+                                     yaxis=dict(tickfont=dict(color='#334155')),
+                                     xaxis=dict(tickfont=dict(color='#334155'), tickformat='.0%'))
+                fig_er.update_traces(marker_line_width=0, textposition='outside')
+                st.plotly_chart(fig_er, use_container_width=True)
+            else:
+                st.caption("Need at least 2 posts per creative type to show this chart.")
+        else:
+            st.caption("No plays / engagement data yet.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with c4:
+        st.markdown("<div class='section-card'><h3>Market Content Mix</h3>", unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>Top creative type per market with share of posts.</p>", unsafe_allow_html=True)
+        mix_src = dff[dff['Creative Type'].notna() & (dff['Creative Type'].astype(str).str.strip() != '')].copy() if 'Creative Type' in dff.columns else pd.DataFrame()
+        if not mix_src.empty and 'market' in mix_src.columns:
+            mix_src = mix_src.assign(**{'Creative Type': mix_src['Creative Type'].astype(str).str.split(', ')}).explode('Creative Type')
+            mix = mix_src.groupby(['market', 'Creative Type']).size().reset_index(name='Posts')
+            totals = mix.groupby('market')['Posts'].transform('sum')
+            mix['Share'] = mix['Posts'] / totals
+            top_mix = mix.sort_values(['market', 'Posts'], ascending=[True, False]).groupby('market').head(3).copy()
+            top_mix['Share'] = top_mix['Share'].apply(lambda x: f'{x:.0%}')
+            top_mix = top_mix.rename(columns={'market': 'Market'})
+            st.dataframe(top_mix[['Market', 'Creative Type', 'Posts', 'Share']], use_container_width=True, hide_index=True)
+        else:
+            st.caption("No market / creative type data yet.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Row 3: Track Leaderboard (full width) ─────────────
     st.markdown("<div class='section-card'><h3>Track Leaderboard by Plays</h3>", unsafe_allow_html=True)
-    if 'plays' in dff.columns and dff['plays'].sum() > 0:
+    if 'plays' in dff.columns and dff['_plays_num'].sum() > 0:
         leaderboard = dff.groupby(['market', 'track']).agg(
-            Total_Plays=('plays', 'sum'),
-            Posts=('id', 'count')
+            Total_Plays=('_plays_num', 'sum'),
+            Posts=('id', 'count'),
+            Avg_Plays=('_plays_num', 'mean'),
+            Total_Engagement=('_engagement_num', 'sum')
         ).reset_index()
-        leaderboard['Avg_Plays'] = (leaderboard['Total_Plays'] / leaderboard['Posts']).round(0)
-        leaderboard['label'] = leaderboard['track'].str[:35]
-        leaderboard = leaderboard.sort_values('Total_Plays', ascending=True)
+        leaderboard['Avg_Plays'] = leaderboard['Avg_Plays'].round(0)
+        leaderboard['Engagement Rate'] = leaderboard['Total_Engagement'] / leaderboard['Total_Plays'].replace(0, pd.NA)
+        leaderboard['label'] = leaderboard['track'].astype(str).str[:45]
+        leaderboard = leaderboard.sort_values('Total_Plays', ascending=True).tail(20)
         fig_lb = px.bar(
             leaderboard, x='Total_Plays', y='label', orientation='h',
             color='market', template='plotly_white',
-            color_discrete_sequence=INDIGO_PALETTE,
-            hover_data={'market': True, 'Posts': True, 'Avg_Plays': True, 'Total_Plays': True, 'label': False},
+            color_discrete_map=MARKET_COLORS,
+            hover_data={'market': True, 'Posts': True, 'Avg_Plays': ':,.0f', 'Total_Plays': ':,.0f', 'Engagement Rate': ':.1%', 'label': False},
             labels={'label': '', 'Total_Plays': 'Total Plays', 'market': 'Market'}
         )
         fig_lb.update_layout(
-            margin=dict(l=0, r=0, t=4, b=0), height=max(280, len(leaderboard) * 36),
+            margin=dict(l=0, r=0, t=4, b=0), height=max(360, len(leaderboard) * 34),
             xaxis_title='Total Plays', yaxis_title='',
             plot_bgcolor='white', paper_bgcolor='white',
             font=dict(color='#334155', size=12),
@@ -3154,9 +3328,9 @@ elif page == "Summary":
         st.caption("No plays data yet.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 3: Market & Track ranked table ───────────────────────────────
-    has_plays = 'plays' in dff.columns and dff['plays'].sum() > 0
-    has_likes = 'likes' in dff.columns and dff['likes'].sum() > 0
+    # ── Row 4: Market & Track ranked table ───────────────────────────────
+    has_plays = '_plays_num' in dff.columns and dff['_plays_num'].sum() > 0
+    has_likes = '_likes_num' in dff.columns and dff['_likes_num'].sum() > 0
 
     st.markdown("<div class='section-card'><h3>Track Performance by Market</h3>", unsafe_allow_html=True)
     mkt_agg = dict(
@@ -3166,18 +3340,18 @@ elif page == "Summary":
         Avg_Confidence=('confidence', 'mean'),
     )
     if has_plays:
-        mkt_agg['Total_Plays'] = ('plays', 'sum')
+        mkt_agg['Total_Plays'] = ('_plays_num', 'sum')
+        mkt_agg['Total_Engagement'] = ('_engagement_num', 'sum')
     if has_likes:
-        mkt_agg['Total_Likes'] = ('likes', 'sum')
+        mkt_agg['Total_Likes'] = ('_likes_num', 'sum')
 
     mkt = dff.groupby(['market', 'track']).agg(**mkt_agg).reset_index()
 
     if has_plays:
         mkt['Avg_Plays'] = (mkt['Total_Plays'] / mkt['Posts']).round(0).astype(int)
+        mkt['Engagement Rate'] = (mkt['Total_Engagement'] / mkt['Total_Plays']).apply(_fmt_pct)
     if has_plays and has_likes:
-        mkt['Like_Rate'] = (mkt['Total_Likes'] / mkt['Total_Plays']).apply(
-            lambda x: f'{x:.1%}' if x == x else '—'
-        )
+        mkt['Like_Rate'] = (mkt['Total_Likes'] / mkt['Total_Plays']).apply(_fmt_pct)
 
     rank_col = 'Total_Plays' if has_plays else 'Posts'
     mkt['Rank'] = mkt.groupby('market')[rank_col].rank(ascending=False, method='min').astype(int)
@@ -3186,22 +3360,22 @@ elif page == "Summary":
     mkt['Avg_Confidence'] = mkt['Avg_Confidence'].apply(lambda x: f'{x:.0%}' if x == x else '—')
 
     display_cols = ['Rank', 'market', 'track', 'Posts', 'Total_Plays', 'Avg_Plays',
-                    'Total_Likes', 'Like_Rate', 'Automation', 'Avg_Confidence', 'Flagged']
+                    'Total_Likes', 'Like_Rate', 'Engagement Rate', 'Automation', 'Avg_Confidence', 'Flagged']
     display_cols = [c for c in display_cols if c in mkt.columns]
     st.dataframe(mkt[display_cols], use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Row 4: What's Working — top narrative per track ───────────────────
+    # ── Row 5: What's Working — top narrative per track ───────────────────
     if 'Narrative' in dff.columns and has_plays:
-        narr_track = dff[dff['Narrative'].notna() & (dff['Narrative'] != '')].copy()
+        narr_track = dff[dff['Narrative'].notna() & (dff['Narrative'].astype(str).str.strip() != '')].copy()
         if not narr_track.empty:
             st.markdown("<div class='section-card'><h3>What's Working — Top Narrative per Track</h3>", unsafe_allow_html=True)
             st.markdown("<p style='font-size:13px;color:#64748b;margin:-8px 0 14px'>For each market + track, the narrative that drives the highest average plays.</p>", unsafe_allow_html=True)
 
             narr_grp = narr_track.groupby(['market', 'track', 'Narrative']).agg(
                 Posts=('id', 'count'),
-                Avg_Plays=('plays', 'mean'),
-                Total_Plays=('plays', 'sum'),
+                Avg_Plays=('_plays_num', 'mean'),
+                Total_Plays=('_plays_num', 'sum'),
             ).reset_index()
             narr_grp['Avg_Plays'] = narr_grp['Avg_Plays'].round(0).astype(int)
 
